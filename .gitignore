@@ -33,6 +33,14 @@ peers.json
 peer-status.json
 trust.json
 identity.crt
+runtime.lock
+daemon.lock
+.suppress
+.silent
+.paused
+.icloud_on
+.icloud_off
+.tailscale_off
 *-latest.json
 clipboard-history/
 clipboard-exports/

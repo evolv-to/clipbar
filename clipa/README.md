@@ -16,7 +16,7 @@ Termux, no root.
 - Survives network changes — Tailscale handles the tunnel; clipa
   reconnects on its own.
 
-Text only in v1. Image clipboard support is a stretch goal.
+The Termux companion currently supports text only. Image clipboard support is a stretch goal.
 
 ## Prerequisites
 
@@ -58,10 +58,10 @@ from `tailscale status`):
 (Tailscale assigns each device an IPv4 in its CGNAT range. Run
 `tailscale status` on each Mac and copy the values straight out.)
 
-If you skip the file or leave it with non-existent hosts, clipa falls back
+If the file is absent, clipa falls back
 to `tailscale status --json` if the Tailscale CLI happens to be installed
 inside Termux. Most users won't have that — static config is the
-recommended path.
+recommended path. An existing empty list disables peer discovery. Pair both devices before starting the agent.
 
 ## Run
 

@@ -32,10 +32,12 @@ class ImageBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.cloud = self.root / 'cloud'
         self.cloud.mkdir()
         for key, value in {'DB_PATH': self.root / 'history.db', 'IMAGES_DIR': self.images,
-                           'ICLOUD_DIR': self.cloud, 'ICLOUD_OFF_FLAG': self.root / 'off'}.items():
+                           'ICLOUD_DIR': self.cloud, 'ICLOUD_OFF_FLAG': self.root / 'off',
+                           'ICLOUD_ON_FLAG': self.root / 'on', 'PAUSE_FLAG': self.root / 'paused'}.items():
             context = patch.object(clipd, key, value)
             context.start()
             self.addCleanup(context.stop)
+        (self.root / 'on').touch()
         self.conn = clipd.setup_db()
         self.addCleanup(self.conn.close)
         self.raw = png()
@@ -66,6 +68,9 @@ class ImageBoundaryTests(unittest.IsolatedAsyncioTestCase):
         raw = self.raw
 
         class Pasteboard:
+            def types(self):
+                return []
+
             def stringForType_(self, kind):
                 return None
 

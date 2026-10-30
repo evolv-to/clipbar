@@ -868,10 +868,11 @@ func main() {
 	}
 
 	if *logFlag != "" {
-		f, err := os.OpenFile(*logFlag, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err == nil {
-			log.SetOutput(f)
+		f, err := privateAppend(*logFlag)
+		if err != nil {
+			log.Fatal("cannot open private log file")
 		}
+		log.SetOutput(f)
 	}
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 

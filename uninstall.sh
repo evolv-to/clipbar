@@ -21,4 +21,4 @@ rm -f "$CLIPBAR_PLIST" "$CLIPD_PLIST"
 echo "==> Done"
 echo
 echo "  Your clipboard history at ~/.config/clipd/ was NOT removed."
-echo "  To wipe it:  rm -rf ~/.config/clipd"
+echo "  For explicit local/cloud deletion, see docs/privacy.md. Pairing identity is preserved."

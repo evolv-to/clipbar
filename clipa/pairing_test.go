@@ -11,6 +11,43 @@ import (
 	"time"
 )
 
+func TestPrivateLogRejectsLinksAndRestrictsMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.log")
+	if err := os.WriteFile(path, []byte("synthetic sentinel"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := privateAppend(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	info, _ := os.Stat(path)
+	if info.Mode().Perm() != 0600 {
+		t.Fatal("log is not private")
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if file, err := privateAppend(link); err == nil {
+		file.Close()
+		t.Fatal("followed symlink")
+	}
+	hard := filepath.Join(dir, "hard")
+	if err := os.Link(path, hard); err != nil {
+		t.Fatal(err)
+	}
+	if file, err := privateAppend(hard); err == nil {
+		file.Close()
+		t.Fatal("accepted hardlink")
+	}
+	content, _ := os.ReadFile(path)
+	if string(content) != "synthetic sentinel" {
+		t.Fatal("log content changed")
+	}
+}
+
 func testTrust(t *testing.T) *trustStore {
 	t.Helper()
 	trust, err := newTrust(t.TempDir())

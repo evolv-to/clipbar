@@ -5,10 +5,10 @@ import Darwin
 
 // MARK: - Constants
 
-private let dbPath       = NSHomeDirectory() + "/.config/clipd/history.db"
-private let suppressPath = NSHomeDirectory() + "/.config/clipd/.suppress"
-private let silencePath  = NSHomeDirectory() + "/.config/clipd/.silent"
-private let tailscaleOffPath = NSHomeDirectory() + "/.config/clipd/.tailscale_off"
+private let dbPath       = PrivateState.path("history.db")
+private let suppressPath = PrivateState.path(".suppress")
+private let silencePath  = PrivateState.path(".silent")
+private let tailscaleOffPath = PrivateState.path(".tailscale_off")
 private let axPromptedKey = "ClipBar.didPromptAccessibility"
 private let interceptCmdVKey = "ClipBar.interceptCmdV"
 
@@ -50,14 +50,28 @@ struct ClipItem {
 
 final class ClipDatabase {
     private var db: OpaquePointer?
+    private var runtimeLock: Int32?
 
     init() {
-        sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil)
+        runtimeLock = PrivateState.lock()
+        openIfNeeded()
+    }
+    private func openIfNeeded() {
+        guard db == nil, runtimeLock != nil, PrivateState.safeDatabase() else { return }
+        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            db = nil
+            return
+        }
         sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
     }
-    deinit { sqlite3_close(db) }
+    deinit {
+        sqlite3_close(db)
+        if let fd = runtimeLock { close(fd) }
+    }
 
     func items(query: String = "") -> [ClipItem] {
+        openIfNeeded()
         guard db != nil else { return [] }
         let sql = query.isEmpty
             ? "SELECT id,type,content,image_path,preview,created_at,source_mac,content_hash FROM items ORDER BY created_at DESC LIMIT 200"
@@ -151,7 +165,7 @@ final class ClipCell: NSTableCellView {
     required init?(coder: NSCoder) { fatalError() }
 
     func configure(_ item: ClipItem) {
-        if item.type == "image", let data = ImageStore.read(item.contentHash, path: item.imagePath),
+        if item.type == "image", let data = ImageStore.read(item.contentHash, path: item.imagePath, directory: PrivateState.directory.appendingPathComponent("images")),
            let img = NSImage(data: data) {
             thumb.image = img
             thumb.contentTintColor = nil
@@ -436,7 +450,7 @@ final class ClipViewController: NSViewController,
         if row >= 0, row < items.count {
             let item = items[row]
             if item.type == "image",
-               let data = ImageStore.read(item.contentHash, path: item.imagePath),
+               let data = ImageStore.read(item.contentHash, path: item.imagePath, directory: PrivateState.directory.appendingPathComponent("images")),
                let img = NSImage(data: data) {
                 previewImage.image = img
                 let dims = "\(Int(img.size.width)) × \(Int(img.size.height))"
@@ -679,7 +693,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try? fm.removeItem(atPath: silencePath)
             NSLog("ClipBar: capture sound → on")
         } else {
-            fm.createFile(atPath: silencePath, contents: nil)
+            PrivateState.setFlag(".silent", enabled: true)
             NSLog("ClipBar: capture sound → off")
         }
     }
@@ -701,6 +715,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let pairing = NSMenuItem(title: "Pair devices…", action: #selector(openPairingGuide), keyEquivalent: "")
         pairing.target = self
         menu.addItem(pairing)
+        let paused = FileManager.default.fileExists(atPath: PrivateState.path(".paused"))
+        let pause = NSMenuItem(title: "Pause clipboard capture", action: #selector(toggleCapturePause), keyEquivalent: "")
+        pause.state = paused ? .on : .off
+        pause.target = self
+        menu.addItem(pause)
+        let cloud = NSMenuItem(title: "Sync through iCloud Drive", action: #selector(toggleCloud), keyEquivalent: "")
+        cloud.state = FileManager.default.fileExists(atPath: PrivateState.path(".icloud_on")) &&
+            !FileManager.default.fileExists(atPath: PrivateState.path(".icloud_off")) ? .on : .off
+        cloud.target = self
+        cloud.toolTip = "Opt in to storing the latest clipboard snapshot in iCloud Drive."
+        menu.addItem(cloud)
 
         let tsItem = NSMenuItem(title: "Sync over Tailscale",
                                 action: #selector(toggleTailscale),
@@ -742,9 +767,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try? fm.removeItem(atPath: tailscaleOffPath)
             NSLog("ClipBar: tailscale sync → on")
         } else {
-            fm.createFile(atPath: tailscaleOffPath, contents: nil)
+            PrivateState.setFlag(".tailscale_off", enabled: true)
             NSLog("ClipBar: tailscale sync → off")
         }
+    }
+
+    @objc private func toggleCapturePause() {
+        let paused = FileManager.default.fileExists(atPath: PrivateState.path(".paused"))
+        PrivateState.setFlag(".paused", enabled: !paused)
+    }
+
+    @objc private func toggleCloud() {
+        let enabled = FileManager.default.fileExists(atPath: PrivateState.path(".icloud_on")) &&
+            !FileManager.default.fileExists(atPath: PrivateState.path(".icloud_off"))
+        if !enabled {
+            let alert = NSAlert()
+            alert.messageText = "Enable iCloud clipboard sync?"
+            alert.informativeText = "Your latest copied text or image will be stored in iCloud Drive. This is separate from paired LAN and Tailscale sync. Disabling it later does not remove existing snapshots."
+            alert.addButton(withTitle: "Enable")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        PrivateState.setFlag(".icloud_on", enabled: !enabled)
+        PrivateState.setFlag(".icloud_off", enabled: enabled)
     }
 
     @objc private func openPairingGuide() {
@@ -763,7 +808,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func fetchPeerSnapshot() -> PeerSnapshot? {
-        guard let d = PeerStatus.read(),
+        guard let d = PeerStatus.read(directory: PrivateState.directory),
               let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
             return nil
         }
@@ -864,7 +909,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if autoPaste, AXIsProcessTrusted(), let prev = previousApp {
-            let pb = NSPasteboard.general
+            let pb = PrivateState.clipboard
             let pid = prev.processIdentifier
 
             // A Carbon hotkey receives every ⌘V before the focused app does.
@@ -873,10 +918,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // deliver the original shortcut to its destination. Finder puts
             // file copies on the pasteboard as either modern file URLs or
             // the older NSFilenamesPboardType; some apps use file promises.
-            if containsFiles(clipboard: pb) {
+            if PrivateState.excluded(pb) || containsFiles(clipboard: pb) {
                 lastAutoPaste = nil
                 simulateKey(virtualKey: 0x09, flags: .maskCommand, toPid: pid)
-                NSLog("ClipBar: ⌘V passthrough — file or folder clipboard")
+                NSLog("ClipBar: ⌘V passthrough — excluded clipboard type")
                 return
             }
             let match = findItemMatching(clipboard: pb)
@@ -1222,10 +1267,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// still get something useful. The suppress flag tells `clipd` not to
     /// echo this write back into history.
     private func writeClipboard(for item: ClipItem) -> Bool {
-        let imageData = item.type == "image" ? ImageStore.read(item.contentHash, path: item.imagePath) : nil
+        let imageData = item.type == "image" ? ImageStore.read(item.contentHash, path: item.imagePath, directory: PrivateState.directory.appendingPathComponent("images")) : nil
         guard (item.type == "text" && item.content != nil) || imageData != nil else { return false }
-        FileManager.default.createFile(atPath: suppressPath, contents: nil)
-        let pb = NSPasteboard.general
+        PrivateState.setFlag(".suppress", enabled: true)
+        let pb = PrivateState.clipboard
         pb.clearContents()
         if item.type == "text", let text = item.content {
             pb.setString(text, forType: .string)

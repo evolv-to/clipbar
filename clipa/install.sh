@@ -8,6 +8,7 @@
 #   bash clipa/install.sh
 
 set -euo pipefail
+umask 077
 
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
@@ -44,6 +45,7 @@ info "binary at $INSTALL_DIR/clipa"
 
 # 3. Config scaffold
 mkdir -p "$CONFIG_DIR" "$(dirname "$LOG_FILE")"
+chmod 700 "$CONFIG_DIR"
 if [ ! -f "$CONFIG_DIR/peers.json" ]; then
     cat > "$CONFIG_DIR/peers.json" <<'EOF'
 [
@@ -57,7 +59,7 @@ if [ ! -f "$CONFIG_DIR/peers.json" ]; then
 ]
 EOF
     info "wrote starter peers.json at $CONFIG_DIR/peers.json"
-    warn "Edit it: replace REPLACE_WITH_* values with your real Mac peers, then restart clipa."
+    warn "Edit the addresses, then pair BOTH devices using docs/pairing.md before starting sync."
 else
     info "peers.json already exists at $CONFIG_DIR/peers.json (left untouched)"
 fi
@@ -79,7 +81,7 @@ warn "  https://f-droid.org/en/packages/com.termux.boot/"
 bold "==> Done."
 echo
 echo "  Next:"
-echo "    1) Edit $CONFIG_DIR/peers.json with your Mac peers."
+echo "    1) Pair both devices (docs/pairing.md) and edit $CONFIG_DIR/peers.json."
 echo "    2) Start now without rebooting: nohup $INSTALL_DIR/clipa --log $LOG_FILE >/dev/null 2>&1 &"
 echo "    3) Tail the log:                tail -f $LOG_FILE"
 echo "    4) Verify on a Mac:             cat ~/.config/clipd/peer-status.json | jq"

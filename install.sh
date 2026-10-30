@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ClipBar installer — builds the app, sets up the daemon, registers launchd agents.
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="ClipBar"
@@ -9,6 +10,7 @@ INSTALLED_APP="/Applications/$APP_NAME.app"
 LA_DIR="$HOME/Library/LaunchAgents"
 CLIPD_PLIST="$LA_DIR/app.clipbar.clipd.plist"
 CLIPBAR_PLIST="$LA_DIR/app.clipbar.ClipBar.plist"
+LOG_DIR="$HOME/.config/clipd/logs"
 
 red()   { printf "\033[31m%s\033[0m\n" "$*"; }
 green() { printf "\033[32m%s\033[0m\n" "$*"; }
@@ -46,6 +48,25 @@ cp -r "$APP_BUNDLE" "$INSTALLED_APP"
 blue "==> Setting up clipd Python venv"
 ( cd "$ROOT/clipd" && uv sync )
 
+# Prepare private logs before launchd opens them. Refuse symlinks/unowned files.
+( cd "$ROOT/clipd" && uv run python - "$LOG_DIR" <<'PYLOG'
+from pathlib import Path
+import sys
+from private_files import private_directory, secure_file
+logs = Path(sys.argv[1])
+private_directory(logs.parent)
+private_directory(logs)
+for name in ('clipd.log', 'clipd.err', 'clipbar.log', 'clipbar.err'):
+    secure_file(logs / name, create=True)
+    # Older installers wrote here. Restrict only owned regular legacy logs;
+    # never read or remove their contents during installation.
+    try:
+        secure_file(Path('/tmp') / name)
+    except (OSError, ValueError):
+        pass
+PYLOG
+)
+
 # --- write launchd plists with absolute paths --------------------------------
 blue "==> Writing launchd agents"
 mkdir -p "$LA_DIR"
@@ -67,8 +88,8 @@ cat > "$CLIPD_PLIST" <<EOF
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/tmp/clipd.log</string>
-    <key>StandardErrorPath</key><string>/tmp/clipd.err</string>
+    <key>StandardOutPath</key><string>$LOG_DIR/clipd.log</string>
+    <key>StandardErrorPath</key><string>$LOG_DIR/clipd.err</string>
 </dict>
 </plist>
 EOF
@@ -85,8 +106,8 @@ cat > "$CLIPBAR_PLIST" <<EOF
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/tmp/clipbar.log</string>
-    <key>StandardErrorPath</key><string>/tmp/clipbar.err</string>
+    <key>StandardOutPath</key><string>$LOG_DIR/clipbar.log</string>
+    <key>StandardErrorPath</key><string>$LOG_DIR/clipbar.err</string>
 </dict>
 </plist>
 EOF
@@ -104,6 +125,6 @@ echo "  • Press ⌘⇧V to open ClipBar"
 echo "  • Right-click the menu bar icon for the menu"
 echo "  • First paste will prompt for Accessibility — grant it, then click Restart from the menu"
 echo
-echo "  Logs:    /tmp/clipbar.log  /tmp/clipd.log"
+echo "  Logs:    $LOG_DIR/clipbar.log  $LOG_DIR/clipd.log"
 echo "  History: ~/.config/clipd/history.db"
 echo "  Uninstall: ./uninstall.sh"

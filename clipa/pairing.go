@@ -304,3 +304,26 @@ func pairingError(err error) {
 	fmt.Fprintln(os.Stderr, "Pairing failed; check certificate, fingerprint, and private state permissions.")
 	os.Exit(1)
 }
+
+func privateAppend(path string) (*os.File, error) {
+	fd, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_APPEND|syscall.O_CREAT|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	owner, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || owner.Uid != uint32(os.Getuid()) || owner.Nlink != 1 || !info.Mode().IsRegular() {
+		file.Close()
+		return nil, errors.New("unowned log file")
+	}
+	if err = file.Chmod(0600); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}

@@ -18,6 +18,9 @@ class ClipboardLogPrivacyTests(unittest.TestCase):
         self.path_patch = patch.object(clipd, "DB_PATH", self.directory / "history.db")
         self.path_patch.start()
         self.addCleanup(self.path_patch.stop)
+        pause_patch = patch.object(clipd, "PAUSE_FLAG", self.directory / "paused")
+        pause_patch.start()
+        self.addCleanup(pause_patch.stop)
         self.conn = clipd.setup_db()
         self.addCleanup(self.conn.close)
         self.content = "synthetic-private-clipboard-content"
@@ -37,6 +40,9 @@ class ClipboardLogPrivacyTests(unittest.TestCase):
 
     def test_capture_stores_and_forwards_text_without_logging_it(self):
         class Pasteboard:
+            def types(self):
+                return []
+
             def stringForType_(inner, _type):
                 return self.content
 

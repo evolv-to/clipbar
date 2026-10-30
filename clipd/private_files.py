@@ -54,3 +54,42 @@ def read_private(path: Path, limit: int = 1024 * 1024) -> bytes:
             return data
     finally:
         os.close(parent)
+
+
+def secure_file(path: Path, create: bool = False) -> bool:
+    import stat
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    if create:
+        flags |= os.O_CREAT
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileNotFoundError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError('state file is not an owned regular file')
+        os.fchmod(fd, 0o600)
+        return True
+    finally:
+        os.close(fd)
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def state_lock(directory: Path, name: str, shared: bool = False):
+    import fcntl
+    private_directory(directory)
+    path = directory / name
+    secure_file(path, create=True)
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('state is in use; stop ClipBar and clipd first') from None
+        yield
+    finally:
+        os.close(fd)

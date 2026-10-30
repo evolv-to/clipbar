@@ -32,6 +32,7 @@ swiftc \
     "$SCRIPT_DIR/Sources/ClipBar/AppDelegate.swift" \
     "$SCRIPT_DIR/Sources/ClipBar/ImageStore.swift" \
     "$SCRIPT_DIR/Sources/ClipBar/PeerStatus.swift" \
+    "$SCRIPT_DIR/Sources/ClipBar/PrivateState.swift" \
     "$SCRIPT_DIR/Sources/ClipBar/main.swift" \
     -o "$BINARY"
 
