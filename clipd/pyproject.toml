@@ -1,0 +1,13 @@
+[project]
+name = "clipd"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.9",
+    "zeroconf>=0.131",
+    "pyobjc-framework-Cocoa>=10.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

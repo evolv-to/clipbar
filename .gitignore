@@ -1,0 +1,69 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Build artifacts
+ClipBar/ClipBar.app/
+ClipBar/build/
+*.dSYM/
+ClipBar/*.zip
+**/build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+local.properties
+
+# Python / uv
+clipd/.venv/
+clipd/__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local runtime data
+.config/clipd/
+.config/clipa/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+peers.json
+*-latest.json
+clipboard-history/
+clipboard-exports/
+clipd/images/
+clipd/exports/
+*.log
+*.err
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+.ssh/
+.aws/
+.gitleaks.local.toml
+.privacy-denylist
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Per-checkout AI agent state (Claude Code, Cursor, etc.)
+.claude/
+.codex/
+.agents/
+
+# clipa Go build cache (keep source, not binaries)
+clipa/clipa
+clipa/clipa-*

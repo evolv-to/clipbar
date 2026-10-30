@@ -1,0 +1,30 @@
+title = "ClipBar credential and privacy checks"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "personal-home-directory"
+description = "A machine-specific home directory"
+regex = '''(?:/Users/|/home/|[A-Za-z]:\\Users\\)[A-Za-z0-9._-]+'''
+
+[[rules]]
+id = "tailnet-ip-address"
+description = "A literal Tailscale-range address"
+regex = '''\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b'''
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''^100\.64\.0\.0$''']
+
+[[rules]]
+id = "personal-email-address"
+description = "A personal email address instead of a public noreply identity"
+regex = '''(?i)[a-z0-9._%+-]+@(?:gmail\.com|googlemail\.com|icloud\.com|me\.com|outlook\.com|hotmail\.com|yahoo\.com|proton\.me|protonmail\.com)\b'''
+
+[[rules]]
+id = "tailnet-domain"
+description = "A device-specific tailnet domain"
+regex = '''(?i)\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:ts\.net|tailscale\.net)\b'''
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''^host\.tailnet\.ts\.net$''']
