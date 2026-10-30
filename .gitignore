@@ -31,6 +31,8 @@ clipd/__pycache__/
 *.sqlite3-*
 peers.json
 peer-status.json
+trust.json
+identity.crt
 *-latest.json
 clipboard-history/
 clipboard-exports/

@@ -688,7 +688,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Build the Sync sub-section: a "Sync over Tailscale" toggle plus a
     /// disabled informational row per known peer. The peer status is
-    /// fetched synchronously from clipd's /peers (localhost — fast).
+    /// read from clipd's fresh owner-only status snapshot.
     private func addSyncSection(to menu: NSMenu) {
         let snap = fetchPeerSnapshot()
 
@@ -697,6 +697,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let header = NSMenuItem(title: "Sync", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
+
+        let pairing = NSMenuItem(title: "Pair devices…", action: #selector(openPairingGuide), keyEquivalent: "")
+        pairing.target = self
+        menu.addItem(pairing)
 
         let tsItem = NSMenuItem(title: "Sync over Tailscale",
                                 action: #selector(toggleTailscale),
@@ -718,7 +722,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // that's the one in active use given the dedup rule.
         let rows = peerRows(from: snap)
         if rows.isEmpty {
-            let none = NSMenuItem(title: "  No peers found",
+            let none = NSMenuItem(title: "  No paired peers available",
                                   action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
@@ -740,6 +744,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             fm.createFile(atPath: tailscaleOffPath, contents: nil)
             NSLog("ClipBar: tailscale sync → off")
+        }
+    }
+
+    @objc private func openPairingGuide() {
+        if let url = URL(string: "https://github.com/evolv-to/clipbar/blob/main/docs/pairing.md") {
+            NSWorkspace.shared.open(url)
         }
     }
 

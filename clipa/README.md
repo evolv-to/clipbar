@@ -1,3 +1,5 @@
+> Protocol 2 requires [mutual certificate pairing](../docs/pairing.md). Upgrade and pair both devices before syncing. An address in peers.json alone grants no access.
+
 # clipa — ClipBar's Termux companion for Android
 
 Bridges Android's system clipboard to a tailnet of ClipBar peers using the

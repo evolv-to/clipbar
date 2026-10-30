@@ -26,6 +26,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -49,7 +50,7 @@ import (
 
 const (
 	listenPort       = 2029
-	protocolVersion  = 1
+	protocolVersion  = 2
 	maxFrameBytes    = 25 * 1024 * 1024
 	pollInterval     = 1500 * time.Millisecond
 	dialInterval     = 10 * time.Second
@@ -107,6 +108,7 @@ type Hello struct {
 	Hostname       string `json:"hostname"`
 	SystemHostname string `json:"system_hostname,omitempty"`
 	Version        int    `json:"version"`
+	Mode           string `json:"mode"`
 }
 
 // envelope used to peek at unknown frames
@@ -188,27 +190,30 @@ func loadTailscalePeers() ([]peerSpec, error) {
 // ---------- peer connection registry ----------
 
 type peerConn struct {
-	ip       string // remote tailnet IP — the dedup key
-	hostname string // display label
-	conn     net.Conn
-	w        *bufio.Writer
-	mu       sync.Mutex // serialise frame writes
+	ip          string // address only
+	fingerprint string
+	initiated   bool
+	hostname    string // display label
+	conn        net.Conn
+	w           *bufio.Writer
+	mu          sync.Mutex // serialise frame writes
 }
 
 func (pc *peerConn) sendItem(payload []byte) error {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+	pc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	defer pc.conn.SetWriteDeadline(time.Time{})
 	if err := writeFrame(pc.w, payload); err != nil {
 		return err
 	}
 	return pc.w.Flush()
 }
 
-// registry is keyed by tailnet IP, not hostname. Each side may know the
-// peer by a different name (the Mac's tailscale status sees us as the
-// device's tailnet name; we send whatever --hostname overrides it to).
-// The IP is the unambiguous identity.
+// Registry keys are approved certificate fingerprints. Addresses and remote
+// hostnames are never authorization identities.
 type registry struct {
+	identity    string
 	mu          sync.Mutex
 	connections map[string]*peerConn // ip -> conn
 }
@@ -222,20 +227,26 @@ func newRegistry() *registry {
 func (r *registry) adopt(pc *peerConn) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if pc.ip != "" {
-		if _, exists := r.connections[pc.ip]; exists {
-			_ = pc.conn.Close()
+	if pc.fingerprint == "" {
+		pc.conn.Close()
+		return false
+	}
+	if existing, exists := r.connections[pc.fingerprint]; exists {
+		preferOutbound := r.identity < pc.fingerprint
+		if pc.initiated != preferOutbound || existing.initiated == preferOutbound {
+			pc.conn.Close()
 			return false
 		}
-		r.connections[pc.ip] = pc
+		existing.conn.Close()
 	}
+	r.connections[pc.fingerprint] = pc
 	return true
 }
 
 func (r *registry) drop(pc *peerConn) {
 	r.mu.Lock()
-	if pc.ip != "" && r.connections[pc.ip] == pc {
-		delete(r.connections, pc.ip)
+	if r.connections[pc.fingerprint] == pc {
+		delete(r.connections, pc.fingerprint)
 	}
 	r.mu.Unlock()
 	_ = pc.conn.Close()
@@ -244,8 +255,12 @@ func (r *registry) drop(pc *peerConn) {
 func (r *registry) hasIP(ip string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, ok := r.connections[ip]
-	return ok
+	for _, peer := range r.connections {
+		if peer.ip == ip {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *registry) snapshot() []*peerConn {
@@ -261,6 +276,8 @@ func (r *registry) snapshot() []*peerConn {
 // ---------- agent ----------
 
 type agent struct {
+	listenAddress  string
+	trust          *trustStore
 	selfHostname   string
 	systemHostname string
 	registry       *registry
@@ -272,11 +289,17 @@ type agent struct {
 	suppressHash string
 }
 
-func newAgent(self, system, peersFile string) *agent {
+func newAgent(self, system, peersFile string, trust *trustStore) *agent {
+	registry := newRegistry()
+	if trust != nil {
+		registry.identity = trust.identity
+	}
 	return &agent{
+		trust:          trust,
+		listenAddress:  "0.0.0.0:2029",
 		selfHostname:   self,
 		systemHostname: system,
-		registry:       newRegistry(),
+		registry:       registry,
 		peersFile:      peersFile,
 	}
 }
@@ -287,6 +310,7 @@ func (a *agent) helloFrame() ([]byte, error) {
 		Hostname:       a.selfHostname,
 		SystemHostname: a.systemHostname,
 		Version:        protocolVersion,
+		Mode:           "stream",
 	})
 }
 
@@ -295,16 +319,20 @@ func (a *agent) helloFrame() ([]byte, error) {
 func (a *agent) serve(ctx context.Context) error {
 	// KeepAlive on incoming sockets so the kernel can prune dead peers.
 	lc := net.ListenConfig{KeepAlive: 30 * time.Second}
-	addr := fmt.Sprintf("0.0.0.0:%d", listenPort)
+	addr := a.listenAddress
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
 		return err
 	}
-	log.Printf("listening on %s", addr)
+	log.Printf("listening on %s", ln.Addr().String())
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
+		for _, peer := range a.registry.snapshot() {
+			a.registry.drop(peer)
+		}
 	}()
+	slots := make(chan struct{}, 64)
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -314,54 +342,68 @@ func (a *agent) serve(ctx context.Context) error {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go a.handleInbound(c)
+		select {
+		case slots <- struct{}{}:
+			go func() { defer func() { <-slots }(); a.handleInbound(c) }()
+		default:
+			c.Close()
+		}
 	}
 }
 
 // handleInbound reads frames from a connection initiated by a peer. The
 // first frame is expected to be a hello; we register the connection so
 // our broadcast loop can push items back over it.
-func (a *agent) handleInbound(c net.Conn) {
+func (a *agent) handleInbound(raw net.Conn) {
+	defer raw.Close()
+	if a.trust == nil {
+		return
+	}
+	config, err := a.trust.config(true)
+	if err != nil {
+		return
+	}
+	c := tls.Server(raw, config)
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	if err = c.Handshake(); err != nil {
+		return
+	}
+	identity, label, err := a.trust.authorize(c)
+	if err != nil {
+		return
+	}
 	br := bufio.NewReader(c)
 	first, err := readFrame(br)
 	if err != nil {
-		_ = c.Close()
 		return
 	}
-	remoteIP := remoteIPOf(c)
-	var env envelope
-	if err := json.Unmarshal(first, &env); err == nil && env.Kind == "hello" {
-		var hello Hello
-		_ = json.Unmarshal(first, &hello)
-		hostname := hello.Hostname
-		if hostname == "" {
-			hostname = "tailscale-peer"
-		}
-		pc := &peerConn{
-			ip:       remoteIP,
-			hostname: hostname,
-			conn:     c,
-			w:        bufio.NewWriter(c),
-		}
-		if !a.registry.adopt(pc) {
-			log.Printf("inbound from %s already covered, dropping", remoteIP)
+	var hello Hello
+	if json.Unmarshal(first, &hello) != nil || hello.Kind != "hello" || hello.Version != protocolVersion || (hello.Mode != "once" && hello.Mode != "stream") {
+		return
+	}
+	response, _ := json.Marshal(Hello{Kind: "hello", Version: protocolVersion, Mode: hello.Mode})
+	if writeFrame(c, response) != nil {
+		return
+	}
+	if hello.Mode == "once" {
+		payload, err := readFrame(br)
+		if err != nil {
 			return
 		}
-		log.Printf("accepted from %s @ %s", hostname, remoteIP)
-		a.readLoop(pc, br)
+		if _, _, err = a.trust.authorize(c); err == nil && a.ingestRaw(payload, label) {
+			var item Item
+			json.Unmarshal(payload, &item)
+			ack, _ := json.Marshal(map[string]string{"_kind": "ack", "content_hash": item.ContentHash})
+			writeFrame(c, ack)
+		}
 		return
 	}
-	// Backwards-compat: connection without hello, treat as one-shot LAN
-	// broadcast. Process this frame and any subsequent ones until EOF.
-	a.ingestRaw(first, "lan-peer")
-	for {
-		raw, err := readFrame(br)
-		if err != nil {
-			break
-		}
-		a.ingestRaw(raw, "lan-peer")
+	c.SetDeadline(time.Time{})
+	pc := &peerConn{ip: remoteIPOf(c), fingerprint: identity, hostname: label, conn: c, w: bufio.NewWriter(c)}
+	if !a.registry.adopt(pc) {
+		return
 	}
-	_ = c.Close()
+	a.readLoop(pc, br)
 }
 
 func remoteIPOf(c net.Conn) string {
@@ -417,37 +459,54 @@ func (a *agent) dialLoop(ctx context.Context) {
 }
 
 func (a *agent) dial(ctx context.Context, p peerSpec, ip string) error {
+	if a.trust == nil {
+		return errors.New("paired trust is required")
+	}
+	config, err := a.trust.config(false)
+	if err != nil {
+		return err
+	}
 	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
-	// KeepAlive on the dialer turns on SO_KEEPALIVE for the resulting
-	// socket — kernel detects dead peers in the background so streaming
-	// reads can be unbounded without leaving zombie connections.
-	d := net.Dialer{KeepAlive: 30 * time.Second}
+	d := tls.Dialer{NetDialer: &net.Dialer{KeepAlive: 30 * time.Second}, Config: config}
 	c, err := d.DialContext(dctx, "tcp", p.Address)
+	if err != nil {
+		return err
+	}
+	success := false
+	defer func() {
+		if !success {
+			c.Close()
+		}
+	}()
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	identity, label, err := a.trust.authorize(c)
 	if err != nil {
 		return err
 	}
 	hello, err := a.helloFrame()
 	if err != nil {
-		_ = c.Close()
 		return err
 	}
-	if err := writeFrame(c, hello); err != nil {
-		_ = c.Close()
+	if err = writeFrame(c, hello); err != nil {
 		return err
 	}
-	pc := &peerConn{
-		ip:       ip,
-		hostname: p.Hostname,
-		conn:     c,
-		w:        bufio.NewWriter(c),
+	br := bufio.NewReader(c)
+	raw, err := readFrame(br)
+	if err != nil {
+		return err
 	}
+	var reply Hello
+	if json.Unmarshal(raw, &reply) != nil || reply.Kind != "hello" || reply.Version != protocolVersion || reply.Mode != "stream" {
+		return errors.New("paired protocol version 2 hello required")
+	}
+	c.SetDeadline(time.Time{})
+	pc := &peerConn{ip: ip, fingerprint: identity, hostname: label, initiated: true, conn: c, w: bufio.NewWriter(c)}
 	if !a.registry.adopt(pc) {
-		log.Printf("dial to %s raced with inbound, dropping outbound", p.Hostname)
 		return nil
 	}
-	log.Printf("connected to %s @ %s", p.Hostname, p.Address)
-	go a.readLoop(pc, bufio.NewReader(c))
+	success = true
+	go a.readLoop(pc, br)
 	return nil
 }
 
@@ -460,7 +519,7 @@ func ipFromAddress(addr string) string {
 }
 
 func (a *agent) discoverPeers() []peerSpec {
-	if peers, err := loadStaticPeers(a.peersFile); err == nil && len(peers) > 0 {
+	if peers, err := loadStaticPeers(a.peersFile); err == nil {
 		return peers
 	}
 	if peers, err := loadTailscalePeers(); err == nil {
@@ -477,8 +536,20 @@ func (a *agent) readLoop(pc *peerConn, br *bufio.Reader) {
 		a.registry.drop(pc)
 	}()
 	for {
-		raw, err := readFrame(br)
+		first, err := br.ReadByte()
 		if err != nil {
+			return
+		}
+		pc.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		raw, err := readFrame(io.MultiReader(strings.NewReader(string([]byte{first})), br))
+		pc.conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			return
+		}
+		if a.trust == nil {
+			return
+		}
+		if _, _, err = a.trust.authorize(pc.conn); err != nil {
 			return
 		}
 		var env envelope
@@ -490,31 +561,35 @@ func (a *agent) readLoop(pc *peerConn, br *bufio.Reader) {
 	}
 }
 
-func (a *agent) ingestRaw(raw []byte, sourceLabel string) {
+func (a *agent) ingestRaw(raw []byte, sourceLabel string) bool {
 	var item Item
 	if err := json.Unmarshal(raw, &item); err != nil {
-		log.Printf("ingest: bad item: %v", err)
-		return
+		log.Printf("rejected malformed clipboard item")
+		return false
 	}
-	a.applyItem(item, sourceLabel)
+	return a.applyItem(item, sourceLabel)
 }
 
-func (a *agent) applyItem(item Item, sourceLabel string) {
+func (a *agent) applyItem(item Item, sourceLabel string) bool {
 	if item.Type == "text" && item.Content != nil {
+		if len(*item.Content) > 1024*1024 || sha256Hex([]byte(*item.Content)) != item.ContentHash {
+			return false
+		}
 		a.suppressMu.Lock()
 		a.suppressHash = item.ContentHash
 		a.suppressMu.Unlock()
 		if err := termuxClipboardSet(*item.Content); err != nil {
 			log.Printf("termux-clipboard-set: %v", err)
-			return
+			return false
 		}
 		log.Printf("received clipboard text from %s", sourceLabel)
-		return
+		return true
 	}
 	// Images currently not pushed to Android's clipboard via termux-api
-	// reliably across Android versions. v1 stretch goal — we drop them
+	// reliably across Android versions. We drop them
 	// silently and rely on Mac peers to keep the canonical history.
-	log.Printf("received %s from %s (skipped: not text)", item.Type, sourceLabel)
+	log.Printf("received unsupported clipboard item (skipped)")
+	return false
 }
 
 // ---------- clipboard polling (sender side) ----------
@@ -537,7 +612,7 @@ func (a *agent) pollLoop(ctx context.Context) {
 			}
 			continue
 		}
-		if text == "" {
+		if text == "" || len(text) > 1024*1024 {
 			continue
 		}
 		hash := sha256Hex([]byte(text))
@@ -580,6 +655,14 @@ func (a *agent) broadcast(payload []byte) {
 	}
 	sent := 0
 	for _, pc := range conns {
+		if a.trust == nil {
+			a.registry.drop(pc)
+			continue
+		}
+		if _, _, err := a.trust.authorize(pc.conn); err != nil {
+			a.registry.drop(pc)
+			continue
+		}
 		if err := pc.sendItem(payload); err != nil {
 			log.Printf("send to %s failed: %v", pc.hostname, err)
 			a.registry.drop(pc)
@@ -733,10 +816,56 @@ var _ = base64.StdEncoding
 // ---------- entrypoint ----------
 
 func main() {
+	listenFlag := flag.String("listen", "0.0.0.0:2029", "TLS listen address")
 	hostnameFlag := flag.String("hostname", "", "override our reported hostname (default: tailnet HostName, else os.Hostname())")
-	peersFlag := flag.String("peers", defaultPeersFile(), "path to peers.json (static peer list)")
+	configFlag := flag.String("config", filepath.Dir(defaultPeersFile()), "private state directory")
+	identityFlag := flag.Bool("identity", false, "show certificate fingerprint (and export with --export)")
+	exportFlag := flag.String("export", "", "export our public certificate to this file")
+	pairFlag := flag.String("pair", "", "import this peer public certificate")
+	fingerprintFlag := flag.String("fingerprint", "", "peer SHA-256 fingerprint confirmed on its own screen")
+	nameFlag := flag.String("name", "", "local label for the paired device")
+	unpairFlag := flag.String("unpair", "", "remove this certificate fingerprint")
+	peersFlag := flag.String("peers", "", "path to peers.json (static peer list)")
 	logFlag := flag.String("log", "", "if set, append logs to this file (otherwise stderr)")
 	flag.Parse()
+	if *peersFlag == "" {
+		*peersFlag = filepath.Join(*configFlag, "peers.json")
+	}
+	trust, err := newTrust(*configFlag)
+	if err != nil {
+		pairingError(err)
+	}
+	if *identityFlag {
+		fmt.Println(trust.identity)
+		if *exportFlag != "" {
+			data, err := privateRead(filepath.Join(*configFlag, "identity.crt"))
+			if err == nil {
+				err = os.WriteFile(*exportFlag, data, 0600)
+			}
+			if err != nil {
+				pairingError(err)
+			}
+		}
+		return
+	}
+	if *pairFlag != "" {
+		data, err := os.ReadFile(*pairFlag)
+		if err == nil {
+			err = trust.pair(data, *fingerprintFlag, *nameFlag)
+		}
+		if err != nil {
+			pairingError(err)
+		}
+		fmt.Println("Peer paired; confirm this device on the other peer too.")
+		return
+	}
+	if *unpairFlag != "" {
+		if err = trust.unpair(*unpairFlag); err != nil {
+			pairingError(err)
+		}
+		fmt.Println("Peer removed.")
+		return
+	}
 
 	if *logFlag != "" {
 		f, err := os.OpenFile(*logFlag, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -778,7 +907,8 @@ func main() {
 		}
 	}
 
-	a := newAgent(self, system, *peersFlag)
+	a := newAgent(self, system, *peersFlag, trust)
+	a.listenAddress = *listenFlag
 	ctx := context.Background()
 
 	go func() {
@@ -787,5 +917,16 @@ func main() {
 		}
 	}()
 	go a.dialLoop(ctx)
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			for _, peer := range a.registry.snapshot() {
+				if _, _, err := trust.authorize(peer.conn); err != nil {
+					a.registry.drop(peer)
+				}
+			}
+		}
+	}()
 	a.pollLoop(ctx)
 }

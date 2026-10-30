@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ from typing import Any, Callable, Optional
 from image_store import (MAX_IMAGE_BYTES, delete_image, image_name, owned_path,
                          read_image, validate_png, write_image)
 from private_files import write_private
+from pairing import Trust
 
 log = logging.getLogger("clipd")
 logging.basicConfig(
@@ -26,7 +28,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-CONFIG_DIR = Path.home() / ".config" / "clipd"
+CONFIG_DIR = Path(os.environ.get("CLIPBAR_CONFIG_DIR", str(Path.home() / ".config" / "clipd"))).expanduser().absolute()
 DB_PATH = CONFIG_DIR / "history.db"
 IMAGES_DIR = CONFIG_DIR / "images"
 SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
@@ -52,8 +54,9 @@ def _icloud_enabled() -> bool:
 
 MAX_ITEMS = 500
 POLL_INTERVAL = 0.3
-LAN_PORT = 2029
-PROTOCOL_VERSION = 1
+LAN_PORT = int(os.environ.get("CLIPBAR_PORT", "2029"))
+BIND_HOST = os.environ.get("CLIPBAR_BIND_HOST", "0.0.0.0")
+PROTOCOL_VERSION = 2
 HOSTNAME = socket.gethostname()
 SERVICE_TYPE = "_clipd._tcp.local."
 SERVICE_NAME = f"clipd-{HOSTNAME}.{SERVICE_TYPE}"
@@ -336,13 +339,11 @@ class ClipboardWatcher:
 # Two frame kinds:
 #   1. Item frame: a clipboard item dict (has "type", "content_hash", "preview").
 #   2. Control frame: dict with "_kind" key. Currently:
-#        {"_kind": "hello", "hostname": "...", "version": 1}
-# Hello must be the first frame on a long-lived connection. It tells the
-# receiver who's on the other end, which lets the receiver use this same
-# socket for outbound items (critical for asymmetric tailnet ACLs where only
-# one side can dial).
-# A connection without a hello is treated as a one-shot LAN broadcast: read
-# frames until EOF, ingest each.
+#        {"_kind": "hello", "version": 2, "mode": "stream"}
+# Hello selects a version and lifecycle; peer identity comes from TLS.
+# Stream mode permits reverse pushes over asymmetric tailnet ACLs.
+# TLS 1.3 with mutual certificate approval precedes every frame. Both sides
+# exchange exact-version hello frames. No plaintext or item-first fallback.
 
 def _frame(payload: dict) -> bytes:
     raw = json.dumps({key: value for key, value in payload.items()
@@ -357,14 +358,16 @@ async def _read_frame(
     which is what streaming connections want — they may sit idle for
     hours; dead-connection detection is the OS's job (TCP keepalive)."""
     if timeout is None:
-        size_bytes = await reader.readexactly(4)
+        # Idle connections may wait; a started frame must finish promptly.
+        first = await reader.readexactly(1)
+        size_bytes = first + await asyncio.wait_for(reader.readexactly(3), timeout=10)
     else:
         size_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
     size = struct.unpack(">I", size_bytes)[0]
     if size > MAX_FRAME_BYTES:
         raise ValueError(f"frame too large: {size}")
     if timeout is None:
-        data = await reader.readexactly(size)
+        data = await asyncio.wait_for(reader.readexactly(size), timeout=30)
     else:
         data = await asyncio.wait_for(reader.readexactly(size), timeout=timeout)
     return json.loads(data)
@@ -391,6 +394,7 @@ def ingest_item(conn: sqlite3.Connection, item: dict, source_label: str) -> bool
         source = item.get("source_mac", source_label)
         if not isinstance(source, str) or len(source) > 255 or any(ord(c) < 32 for c in source):
             raise ValueError("invalid source")
+        source = source_label  # authenticated local pairing label, not a sender claim
         image_path = None
         content = None
         if kind == "text":
@@ -426,11 +430,42 @@ def ingest_item(conn: sqlite3.Connection, item: dict, source_label: str) -> bool
 # LAN sync
 # ---------------------------------------------------------------------------
 
+def _hello(mode: str) -> dict:
+    return {"_kind": "hello", "version": PROTOCOL_VERSION, "mode": mode}
+
+
+def _check_hello(value: Any, mode: str | None = None) -> str:
+    if (not isinstance(value, dict) or value.get("_kind") != "hello"
+            or type(value.get("version")) is not int or value.get("version") != PROTOCOL_VERSION
+            or value.get("mode") not in ("once", "stream")
+            or (mode is not None and value["mode"] != mode)):
+        raise ValueError("paired protocol version 2 hello required")
+    return value["mode"]
+
+
+def _is_tailnet_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+        return (ip in ipaddress.ip_network("100.64.0.0/10") if ip.version == 4
+                else ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+    except ValueError:
+        return False
+
+
+def _network_allowed(writer) -> bool:
+    address = (writer.get_extra_info("peername") or ("",))[0]
+    return bool(address) and (not _is_tailnet_address(address) or not TAILSCALE_OFF_FLAG.exists())
+
+
 class LANSync:
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, trust: Trust) -> None:
         self._conn = conn
+        self.trust = trust
+        self.last_sent: set[str] = set()
+        self._trust_task = None
+        self._server_revision = None
         # service name -> (system_hostname, tailnet_hostname, host, port)
-        self._peers: dict[str, tuple[str, str, str, int]] = {}
+        self._peers: dict[str, tuple[str, str, str, int, str]] = {}
         self._server: Optional[asyncio.Server] = None
         self._tailscale: Optional["TailscaleSync"] = None
 
@@ -445,18 +480,22 @@ class LANSync:
         # inbound Tailscale dials) depend on this port; mDNS is only
         # discovery sugar and must not be able to take the listener down.
         self._server = await asyncio.start_server(
-            self._handle_peer, "0.0.0.0", LAN_PORT
+            self._handle_peer, BIND_HOST, LAN_PORT,
+            ssl=self.trust.context(server=True), ssl_handshake_timeout=5,
+            ssl_shutdown_timeout=2,
         )
+        self._server_revision = self.trust.revision
+        self._trust_task = asyncio.create_task(self._watch_trust())
         log.info("LAN sync on port %d", LAN_PORT)
 
+        if os.environ.get("CLIPBAR_NO_DISCOVERY") == "1":
+            return
         self._zc = AsyncZeroconf()
         ip = _local_ip()
         from zeroconf import ServiceInfo  # type: ignore[import]
-        # Advertise BOTH identities so cross-channel dedup works even when
-        # the system hostname (Bonjour-style "host.local") differs from
-        # the tailnet name (whatever Tailscale assigned the device). The
-        # Tailscale hello frame carries the same pair.
-        props: dict[str, str] = {"hostname": HOSTNAME}
+        # Advertisements are address hints only. The certificate fingerprint
+        # must already be approved and must match the actual TLS peer.
+        props: dict[str, str] = {"hostname": HOSTNAME, "fingerprint": self.trust.identity, "version": "2"}
         if tailnet_hostname:
             props["tailnet_hostname"] = tailnet_hostname
         info = ServiceInfo(
@@ -513,7 +552,13 @@ class LANSync:
         if not hostname:
             # fall back to parsing the service name "clipd-<host>._..."
             hostname = name.split(".", 1)[0].removeprefix("clipd-")
-        self._peers[name] = (hostname, tailnet_hostname, host, info.port)
+        identity = (info.properties.get(b"fingerprint") or b"").decode(errors="replace")
+        self.trust.reload()
+        if identity not in self.trust.peers or info.properties.get(b"version") != b"2":
+            self._peers.pop(name, None)
+            return
+        hostname = self.trust.peers[identity]["name"]
+        self._peers[name] = (hostname, tailnet_hostname, host, info.port, identity)
         log.info(
             "LAN peer: %s%s @ %s:%d",
             hostname,
@@ -526,7 +571,7 @@ class LANSync:
         peers. Returns BOTH the system hostname and tailnet hostname for each
         peer so TailscaleSync can dedup whichever name it knows the peer by."""
         out: set[str] = set()
-        for (sysname, tnname, _, _) in self._peers.values():
+        for (sysname, tnname, _, _, _) in self._peers.values():
             if sysname:
                 out.add(_norm_host(sysname))
             if tnname:
@@ -535,7 +580,9 @@ class LANSync:
 
     def peer_status(self) -> list[dict]:
         out: list[dict] = []
-        for (sysname, tnname, host, port) in self._peers.values():
+        for (sysname, tnname, host, port, identity) in self._peers.values():
+            if identity not in self.trust.peers:
+                continue
             label = sysname or tnname or "?"
             entry = {"hostname": label, "address": f"{host}:{port}", "transport": "lan"}
             if tnname and sysname and _norm_host(tnname) != _norm_host(sysname):
@@ -544,54 +591,105 @@ class LANSync:
         return out
 
     async def broadcast(self, item: dict) -> None:
-        framed = _frame(item)
-        for name, (hostname, _tn, host, port) in list(self._peers.items()):
+        self.last_sent = set()
+        for _, (_, _, host, port, expected) in list(self._peers.items()):
+            writer = None
             try:
-                _, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=2.0
-                )
-                writer.write(framed)
-                await asyncio.wait_for(writer.drain(), timeout=2.0)
-                writer.close()
-            except Exception as exc:
-                log.debug("LAN broadcast to %s failed: %s", hostname, exc)
+                context = self.trust.context(server=False)
+                if expected not in self.trust.peers:
+                    continue
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(
+                    host, port, ssl=context, server_hostname="", ssl_handshake_timeout=5,
+                    ssl_shutdown_timeout=2), timeout=6)
+                identity, _ = self.trust.authorize(writer)
+                if identity != expected or not _network_allowed(writer):
+                    raise ValueError("unexpected or disabled peer")
+                writer.write(_frame(_hello("once")))
+                await asyncio.wait_for(writer.drain(), 5)
+                _check_hello(await _read_frame(reader, 5), "once")
+                self.trust.authorize(writer)
+                writer.write(_frame(item))
+                await asyncio.wait_for(writer.drain(), 5)
+                reply = await _read_frame(reader, 5)
+                if not isinstance(reply, dict) or reply.get("_kind") != "ack" or reply.get("content_hash") != item.get("content_hash"):
+                    raise ValueError("LAN item was not acknowledged")
+                self.last_sent.add(identity)
+            except Exception:
+                log.debug("paired LAN send failed")
+            finally:
+                if writer:
+                    writer.close()
 
-    async def _handle_peer(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def _handle_peer(self, reader, writer) -> None:
         _enable_keepalive(writer)
-        peer_label = "lan-peer"
         handed_off = False
         try:
-            first = await _read_frame(reader, timeout=10.0)
-            if isinstance(first, dict) and first.get("_kind") == "hello":
-                hostname = str(first.get("hostname") or "tailscale-peer")
-                system_hostname = str(first.get("system_hostname") or "")
-                if self._tailscale is not None:
-                    self._tailscale.register_inbound(
-                        hostname, reader, writer, system_hostname=system_hostname,
-                    )
-                    handed_off = True
-                    return
-                peer_label = hostname
-            else:
-                ingest_item(self._conn, first, peer_label)
-                # Some peers may keep the connection open and stream more
-                # items. Keep reading until EOF — no per-read deadline,
-                # idle is fine (TCP keepalive detects dead connections).
-                while True:
-                    item = await _read_frame(reader, timeout=None)
-                    ingest_item(self._conn, item, peer_label)
-        except (asyncio.IncompleteReadError, ConnectionError, asyncio.TimeoutError):
-            pass
-        except Exception as exc:
-            log.debug("peer receive error: %s", exc)
+            _, label = self.trust.authorize(writer)
+            if not _network_allowed(writer):
+                raise ValueError("transport disabled")
+            mode = _check_hello(await _read_frame(reader, 5))
+            writer.write(_frame(_hello(mode)))
+            await asyncio.wait_for(writer.drain(), 5)
+            if mode == "stream" and self._tailscale is not None:
+                self._tailscale.register_inbound(label, reader, writer)
+                handed_off = True
+                return
+            if mode != "once":
+                raise ValueError("stream receiver unavailable")
+            item = await _read_frame(reader, 10)
+            self.trust.authorize(writer)
+            if ingest_item(self._conn, item, label):
+                writer.write(_frame({"_kind": "ack", "content_hash": item["content_hash"]}))
+                await asyncio.wait_for(writer.drain(), 5)
+        except (Exception, asyncio.CancelledError):
+            pass  # No payload or attacker-controlled metadata in diagnostics.
         finally:
             if not handed_off:
-                try:
-                    writer.close()
-                except Exception:
-                    pass
+                writer.close()
+
+    async def _watch_trust(self):
+        while True:
+            try:
+                self.trust.reload()
+                if self.trust.revision != self._server_revision:
+                    if self._server:
+                        self._server.close()
+                        await self._server.wait_closed()
+                    self._server = await asyncio.start_server(
+                        self._handle_peer, BIND_HOST, LAN_PORT,
+                        ssl=self.trust.context(server=True), ssl_handshake_timeout=5,
+                        ssl_shutdown_timeout=2)
+                    self._server_revision = self.trust.revision
+                    # A newly approved device may already be in the mDNS cache.
+                    # Resubscribe so pairing takes effect without a restart.
+                    if getattr(self, "_browser", None):
+                        from zeroconf.asyncio import AsyncServiceBrowser
+                        await self._browser.async_cancel()
+                        self._browser = AsyncServiceBrowser(self._zc.zeroconf, SERVICE_TYPE,
+                                                            handlers=[self._on_state_change])
+                if self._tailscale:
+                    self._tailscale.close_unapproved()
+            except (OSError, ValueError):
+                if self._server:
+                    self._server.close()
+                    await self._server.wait_closed()
+                    self._server = None
+                self._server_revision = None
+                if self._tailscale:
+                    self._tailscale._close_all("invalid trust state")
+            await asyncio.sleep(1)
+
+    async def stop(self):
+        if self._trust_task:
+            self._trust_task.cancel()
+            await asyncio.gather(self._trust_task, return_exceptions=True)
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+        if getattr(self, "_browser", None):
+            await self._browser.async_cancel()
+        if getattr(self, "_zc", None):
+            await self._zc.async_close()
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +716,7 @@ def _tailscale_binary() -> Optional[str]:
 class _PeerConn:
     __slots__ = (
         "ip", "hostname", "system_hostname", "reader", "writer",
-        "initiated", "address", "since",
+        "initiated", "address", "since", "fingerprint",
     )
 
     def __init__(
@@ -631,7 +729,8 @@ class _PeerConn:
         address: str,
         system_hostname: str = "",
     ) -> None:
-        self.ip = ip                      # tailnet IP — the dedup key
+        self.fingerprint = ""
+        self.ip = ip                      # address only; certificate is identity
         self.hostname = hostname          # display label (tailnet hostname)
         self.system_hostname = system_hostname
         self.reader = reader
@@ -660,12 +759,14 @@ class TailscaleSync:
         self,
         conn: sqlite3.Connection,
         get_lan_hostnames: Callable[[], set[str]],
+        trust: Trust,
     ) -> None:
         self._conn = conn
-        self._get_lan_hostnames = get_lan_hostnames
-        # key = tailnet IP. Hostnames are display-only because each side
-        # may know the peer by a different name (mDNS hostname, tailnet
-        # hostname, --hostname override). The IP is the unambiguous identity.
+        self._get_lan_hostnames = get_lan_hostnames  # successfully sent fingerprints
+        self.trust = trust
+        self._dial_task = None
+        # Exact approved certificate fingerprints are identities. Addresses
+        # are connection hints; labels come from the local trust store.
         self._connections: dict[str, _PeerConn] = {}
         # ip -> (next_attempt_at, current_delay)
         self._backoff: dict[str, tuple[float, float]] = {}
@@ -682,6 +783,8 @@ class TailscaleSync:
         return self._enabled and not TAILSCALE_OFF_FLAG.exists()
 
     async def start(self) -> None:
+        if os.environ.get("CLIPBAR_NO_DISCOVERY") == "1":
+            return
         self._tailscale_bin = _tailscale_binary()
         if not self._tailscale_bin:
             log.info("tailscale binary not found; tailscale sync disabled")
@@ -697,7 +800,7 @@ class TailscaleSync:
         except Exception:
             pass
         log.info("tailscale sync starting (self=%s)", self._self_hostname)
-        asyncio.create_task(self._dial_loop())
+        self._dial_task = asyncio.create_task(self._dial_loop())
 
     async def _tailscale_status(self) -> Optional[dict]:
         if not self._tailscale_bin:
@@ -736,13 +839,13 @@ class TailscaleSync:
         while True:
             try:
                 if not self.is_enabled():
-                    self._close_all("disabled")
+                    self.close_unapproved()
                     await asyncio.sleep(5.0)
                     continue
                 await self._refresh_peers()
                 now = time.time()
                 for hostname, ip in self._discovered.items():
-                    if ip in self._connections:
+                    if any(peer.ip == ip for peer in self._connections.values()):
                         continue  # already connected (in either direction)
                     next_attempt, _ = self._backoff.get(ip, (0.0, 5.0))
                     if now < next_attempt:
@@ -771,76 +874,58 @@ class TailscaleSync:
         self._connections.clear()
 
     async def _dial(self, hostname: str, ip: str) -> None:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, LAN_PORT), timeout=5.0
-        )
-        _enable_keepalive(writer)
-        hello = {
-            "_kind": "hello",
-            "hostname": self._self_hostname,    # tailnet name
-            "system_hostname": HOSTNAME,        # OS hostname (for cross-channel dedup)
-            "version": PROTOCOL_VERSION,
-        }
-        writer.write(_frame(hello))
-        await asyncio.wait_for(writer.drain(), timeout=5.0)
-        peer = _PeerConn(
-            ip=ip, hostname=hostname,
-            reader=reader, writer=writer,
-            initiated=True, address=ip,
-        )
-        if not self._adopt(peer):
-            log.debug("tailscale: dial to %s already covered, dropping", ip)
-            return
-        log.info("tailscale: connected to %s @ %s", hostname, ip)
-
-    def register_inbound(
-        self,
-        hostname: str,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        system_hostname: str = "",
-    ) -> None:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(
+            ip, LAN_PORT, ssl=self.trust.context(server=False), server_hostname="",
+            ssl_handshake_timeout=5, ssl_shutdown_timeout=2), timeout=6)
         try:
-            peername = writer.get_extra_info("peername") or ("?", 0)
-            ip = peername[0]
-            address = f"{peername[0]}:{peername[1]}"
-        except Exception:
-            ip = ""
-            address = "?"
-        peer = _PeerConn(
-            ip=ip, hostname=hostname,
-            reader=reader, writer=writer,
-            initiated=False, address=address,
-            system_hostname=system_hostname,
-        )
-        if not self._adopt(peer):
-            log.debug("tailscale: inbound from %s already covered, dropping", ip)
-            return
-        log.info(
-            "tailscale: accepted from %s%s @ %s",
-            hostname,
-            f"/{system_hostname}" if system_hostname and _norm_host(system_hostname) != _norm_host(hostname) else "",
-            address,
-        )
+            identity, label = self.trust.authorize(writer)
+            if not self.is_enabled() or not _network_allowed(writer):
+                raise ValueError("transport disabled")
+            _enable_keepalive(writer)
+            writer.write(_frame(_hello("stream")))
+            await asyncio.wait_for(writer.drain(), timeout=5)
+            _check_hello(await _read_frame(reader, 5), "stream")
+            peer = _PeerConn(ip, label, reader, writer, True, ip)
+            peer.fingerprint = identity
+            self._adopt(peer)
+        except BaseException:
+            writer.close()
+            raise
+
+    def register_inbound(self, hostname, reader, writer, system_hostname="") -> None:
+        identity, label = self.trust.authorize(writer)
+        address = writer.get_extra_info("peername") or ("", 0)
+        peer = _PeerConn(address[0], label, reader, writer, False, str(address[0]))
+        peer.fingerprint = identity
+        self._adopt(peer)
 
     def _adopt(self, peer: _PeerConn) -> bool:
-        """Add peer to the registry. Returns True if adopted, False if a
-        live connection for the same IP already exists (the new one is
-        rejected to avoid duplicate sends to the same physical device)."""
-        if not peer.ip:
-            # No IP we can dedup against — best-effort: just accept.
-            asyncio.create_task(self._read_loop(peer))
-            return True
-        existing = self._connections.get(peer.ip)
-        if existing is not None:
-            # Already connected to this peer in some direction. Refuse the
-            # new connection. The old one will be cleaned up by its own
-            # read loop on EOF / failed write.
-            peer.close()
-            return False
-        self._connections[peer.ip] = peer
+        existing = self._connections.get(peer.fingerprint)
+        if existing:
+            # Both sides make the same decision when simultaneous dials cross.
+            prefer_outbound = self.trust.identity < peer.fingerprint
+            if peer.initiated != prefer_outbound or existing.initiated == prefer_outbound:
+                peer.close()
+                return False
+            existing.close()
+        self._connections[peer.fingerprint] = peer
         asyncio.create_task(self._read_loop(peer))
         return True
+
+    def close_unapproved(self):
+        for peer in list(self._connections.values()):
+            try:
+                self.trust.authorize(peer.writer)
+                if not _network_allowed(peer.writer):
+                    raise ValueError("transport disabled")
+            except ValueError:
+                peer.close()
+
+    async def stop(self):
+        if self._dial_task:
+            self._dial_task.cancel()
+            await asyncio.gather(self._dial_task, return_exceptions=True)
+        self._close_all("shutdown")
 
     async def _read_loop(self, peer: _PeerConn) -> None:
         try:
@@ -852,35 +937,41 @@ class TailscaleSync:
                 item = await _read_frame(peer.reader, timeout=None)
                 if isinstance(item, dict) and item.get("_kind"):
                     continue  # ignore unknown control frames
-                ingest_item(self._conn, item, f"tailscale:{peer.hostname}")
+                self.trust.authorize(peer.writer)
+                if not _network_allowed(peer.writer):
+                    raise ValueError("transport disabled")
+                ingest_item(self._conn, item, peer.hostname)
         except (asyncio.IncompleteReadError, ConnectionError, asyncio.TimeoutError):
             pass
         except Exception as exc:
             log.debug("tailscale read %s error: %s", peer.hostname, exc)
         finally:
             peer.close()
-            if peer.ip and self._connections.get(peer.ip) is peer:
-                self._connections.pop(peer.ip, None)
+            if self._connections.get(peer.fingerprint) is peer:
+                self._connections.pop(peer.fingerprint, None)
                 log.info("tailscale: disconnected from %s", peer.hostname)
 
     async def broadcast(self, item: dict) -> None:
-        if not self.is_enabled() or not self._connections:
+        if not self._connections:
             return
         lan = self._get_lan_hostnames()
         framed = _frame(item)
         for ip, peer in list(self._connections.items()):
-            if peer.names() & lan:
+            if peer.fingerprint in lan:
                 log.debug("tailscale: skip %s (reachable on LAN)", peer.hostname)
                 continue
             try:
+                self.trust.authorize(peer.writer)
+                if not _network_allowed(peer.writer):
+                    raise ValueError("transport disabled")
                 peer.writer.write(framed)
                 await asyncio.wait_for(peer.writer.drain(), timeout=10.0)
                 log.debug("tailscale: sent %d bytes to %s", len(framed), peer.hostname)
             except Exception as exc:
                 log.info("tailscale send to %s failed (closing): %s", peer.hostname, exc)
                 peer.close()
-                if self._connections.get(ip) is peer:
-                    self._connections.pop(ip, None)
+                if self._connections.get(peer.fingerprint) is peer:
+                    self._connections.pop(peer.fingerprint, None)
 
     def peer_status(self) -> list[dict]:
         out: list[dict] = []
@@ -888,7 +979,7 @@ class TailscaleSync:
             entry = {
                 "hostname": peer.hostname,
                 "address": peer.address,
-                "transport": "tailscale",
+                "transport": "tailscale" if _is_tailnet_address(peer.ip) else "lan",
                 "direction": "out" if peer.initiated else "in",
                 "since": peer.since,
             }
@@ -903,7 +994,7 @@ class TailscaleSync:
 
     def discovered_status(self) -> list[dict]:
         return [
-            {"hostname": h, "address": ip, "connected": ip in self._connections}
+            {"hostname": h, "address": ip, "connected": any(p.ip == ip for p in self._connections.values())}
             for h, ip in self._discovered.items()
         ]
 
@@ -984,10 +1075,11 @@ class ICloudSync:
 # ---------------------------------------------------------------------------
 
 def write_peer_status(lan: "LANSync", tailscale: "TailscaleSync") -> None:
+    streams = tailscale.peer_status()
     snapshot = {
         "self": HOSTNAME,
-        "lan": lan.peer_status(),
-        "tailscale": tailscale.peer_status(),
+        "lan": lan.peer_status() + [peer for peer in streams if peer.get("transport") == "lan"],
+        "tailscale": [peer for peer in streams if peer.get("transport") != "lan"],
         "tailscale_discovered": tailscale.discovered_status(),
         "tailscale_available": tailscale.is_available(),
         "tailscale_enabled": tailscale.is_enabled(),
@@ -1048,8 +1140,9 @@ async def main() -> None:
     setup_dirs()
     conn = setup_db()
 
-    lan = LANSync(conn)
-    tailscale = TailscaleSync(conn, lan.peer_hostnames)
+    trust = Trust(CONFIG_DIR)
+    lan = LANSync(conn, trust)
+    tailscale = TailscaleSync(conn, lambda: lan.last_sent, trust)
     lan.attach_tailscale(tailscale)
     icloud = ICloudSync(conn)
 
@@ -1083,8 +1176,53 @@ async def main() -> None:
     except Exception as exc:
         log.warning("LAN sync disabled: %s", exc)
 
-    await asyncio.gather(watcher.run(), icloud.watch(), publish_peer_status(lan, tailscale))
+    try:
+        await asyncio.gather(watcher.run(), icloud.watch(), publish_peer_status(lan, tailscale))
+    finally:
+        await lan.stop()
+        await tailscale.stop()
+        conn.close()
+
+
+def cli() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="ClipBar clipboard daemon and device pairing")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("run", help="run the daemon")
+    identity = sub.add_parser("identity", help="show this device's public certificate fingerprint")
+    identity.add_argument("--export", type=Path, help="export the public certificate (never the private key)")
+    pair = sub.add_parser("pair", help="approve a device after confirming its fingerprint")
+    pair.add_argument("--certificate", type=Path, required=True)
+    pair.add_argument("--fingerprint", required=True)
+    pair.add_argument("--name", required=True)
+    unpair = sub.add_parser("unpair", help="revoke a paired device")
+    unpair.add_argument("fingerprint")
+    sub.add_parser("paired", help="list locally approved device labels and fingerprints")
+    args = parser.parse_args()
+    if args.command in (None, "run"):
+        asyncio.run(main())
+        return
+    from private_files import read_private
+    try:
+        trust = Trust(CONFIG_DIR)
+        if args.command == "identity":
+            print(trust.identity)
+            if args.export:
+                write_private(args.export.absolute(), read_private(trust.cert))
+        elif args.command == "pair":
+            with args.certificate.open("rb") as stream:
+                certificate = stream.read(16385).decode()
+            trust.pair(certificate, args.fingerprint, args.name)
+            print("Peer paired. Confirm this device on the other peer too.")
+        elif args.command == "unpair":
+            trust.unpair(args.fingerprint)
+            print("Peer removed. Active connections close within one second.")
+        elif args.command == "paired":
+            for identity, peer in trust.peers.items():
+                print(identity, peer["name"])
+    except (OSError, ValueError):
+        parser.exit(1, "Pairing failed. Check certificate, fingerprint, and private state permissions.\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    cli()

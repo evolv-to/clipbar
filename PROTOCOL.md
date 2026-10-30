@@ -1,155 +1,84 @@
-# ClipBar sync wire protocol
+# ClipBar sync protocol 2
 
-This is the on-the-wire protocol shared by the macOS daemon (`clipd/clipd.py`)
-and the Android Termux agent (`clipa/main.go`). Anyone implementing a new
-ClipBar client should match this spec exactly.
+The tracked macOS daemon and Go Termux companion use this protocol. Version 1
+clients are incompatible and must be upgraded and paired. There is no plaintext,
+item-first, or older-version fallback. The separate experimental Kotlin client
+has not been upgraded to this protocol and is not a supported secure client.
 
-Protocol version: **1**.
+## Transport and identity
 
-## Transport
+Every connection uses **TLS 1.3 with mutual certificate authentication**, normally
+on TCP port 2029. Each device owns a P-256 private key and self-signed certificate.
+Pairing imports the other device's public certificate after explicit confirmation
+of its SHA-256 DER fingerprint through a trusted channel. Both devices must approve
+each other. See [pairing instructions](docs/pairing.md).
 
-- Plain TCP. No TLS.
-  - On LAN: rely on local network trust (same as the existing zero-config
-    behaviour).
-  - On Tailscale: rely on WireGuard end-to-end encryption between tailnet
-    peers. Tailscale ACLs gate who may dial whom.
-- Listen port: **2029** on every device that participates in sync.
-- Connections are bidirectional once the dialer announces itself with a
-  hello frame (see below). This matters when ACLs are asymmetric — the
-  side that can dial holds the duplex pipe.
+The TLS certificate chain, validity and client/server usage are verified, and the
+exact leaf certificate fingerprint must be in the local trust store. No system CA,
+hostname, IP address, Tailscale membership or mDNS advertisement grants trust.
+Hostnames are display information; local pairing labels identify approved peers.
+Private keys and trust files stay in owner-only local state.
 
-## Frame format
+Trust changes reload without restarting. Revocation is checked before each send
+and ingestion, and idle revoked streams are closed within about one second.
+Previously delivered or in-flight data cannot be recalled. Certificate rotation
+requires explicit re-pairing; partial/missing identity files do not silently
+regenerate an existing identity.
 
-Every message is a length-prefixed JSON object:
+## Frames and handshake
 
-```
-+--------+----------------------+
-| length |     JSON payload     |
-| u32 BE |    UTF-8 bytes       |
-+--------+----------------------+
-```
+After TLS, messages are a four-byte unsigned big-endian length followed by UTF-8
+JSON. Maximum encoded frame length is 25 MiB. A started frame has bounded header
+and body read deadlines; an established idle stream may remain open.
 
-- `length` is an unsigned 32-bit big-endian integer giving the byte length
-  of the JSON payload that follows.
-- Maximum frame size: **25 MiB**. Receivers must drop the connection if
-  they read a length larger than this.
-- The JSON object always has a `_kind` field (control frames) **or** the
-  shape of an item frame (everything else). Both are described below.
-
-## Control frames
-
-### `hello` (required as the first frame on a long-lived connection)
+The initiator sends, and the acceptor must answer, exactly this versioned hello:
 
 ```json
-{
-  "_kind": "hello",
-  "hostname": "<tailnet-hostname>",
-  "system_hostname": "<os-hostname>",
-  "version": 1
-}
+{"_kind":"hello","version":2,"mode":"stream"}
 ```
 
-- `hostname`: the dialer's identity for routing — the tailnet hostname
-  shown by `tailscale status`. On Macs without the Tailscale CLI this
-  falls back to `socket.gethostname()`. On the Termux agent it's the
-  device's tailnet hostname (or whatever `--hostname` overrides it to).
-- `system_hostname` (optional): the dialer's OS hostname (e.g. the
-  Bonjour name `host.local`). Used by the receiver to deduplicate
-  against LAN-discovered peers — mDNS announces the OS hostname while
-  tailnet announces the tailnet name, and both can refer to the same
-  physical device.
-- `version`: protocol version. Receivers should accept any value `<=` their
-  own, ignore unknown fields, and refuse strictly higher major versions.
+`mode` is either `stream` (persistent bidirectional sync) or `once` (one LAN item
+followed by a matching `{"_kind":"ack","content_hash":"..."}` acknowledgement and close). The response echoes the mode. Neither side sends clipboard
+content until TLS authentication and the hello exchange have succeeded. Unknown
+versions/modes and missing hello frames close the connection.
 
-A connection without a hello is treated as a one-shot LAN broadcast: the
-receiver reads item frames until EOF, ingests each, and closes. This keeps
-backwards compatibility with the original LAN sync.
+Persistent connections deduplicate by certificate fingerprint. On simultaneous
+crossed dials, the device with the lexicographically smaller fingerprint keeps its
+outbound connection and the other keeps its inbound connection.
 
-## Item frames
+## Items
 
-Every other frame is a clipboard item. Required fields:
+| Field | Meaning |
+| --- | --- |
+| `type` | `text` or `image` |
+| `content` | Text, for text items only; maximum 1 MiB UTF-8 |
+| `image_data` | Strict base64 of PNG bytes, for images; maximum 16 MiB decoded |
+| `content_hash` | Lowercase SHA-256 hex of UTF-8 text or raw PNG bytes |
+| `preview` | Optional display hint; receivers derive their own preview |
+| `source_mac` | Optional display metadata; never an authorization identity |
+| `created_at` | Optional source timestamp; receivers use local receipt time |
 
-| Field          | Type     | Description                                              |
-|----------------|----------|----------------------------------------------------------|
-| `type`         | string   | `"text"` or `"image"`.                                   |
-| `content`      | string?  | Present iff `type == "text"`. UTF-8 plain text.          |
-| `image_data`   | string?  | Present iff `type == "image"`. Base64-encoded PNG bytes. |
-| `image_path`   | string?  | Sender-local file path (informational, may be ignored).  |
-| `preview`      | string   | Short human-readable preview, ≤ 120 chars.               |
-| `content_hash` | string   | SHA-256 hex digest of the canonical content.             |
-| `created_at`   | float    | Unix timestamp at the source.                            |
-| `source_mac`   | string   | Source device label (free-form, used in the UI).         |
+Local `id` and `image_path` fields are never sent. Receivers verify content hashes
+and types. macOS validates PNG decoding/dimensions (maximum 20 million pixels),
+derives an owned image filename, and rejects untrusted paths and symlinks. Termux
+supports text clipboard delivery; it ignores image items. Ingested items are not
+rebroadcast. Repeated content promotes its existing local row rather than adding
+another row; remote timestamps do not control retention ordering.
 
-Hashing rules:
+## Discovery and toggles
 
-- Text: `sha256(content_bytes_utf8).hexdigest()`.
-- Image: `sha256(raw_png_bytes).hexdigest()`.
+LAN discovery uses `_clipd._tcp.local.` with `version=2`, `fingerprint`, and optional
+hostname TXT values. These are hints only: the certificate presented by the actual
+connection must match the already approved fingerprint. Unapproved advertisers
+receive no clipboard payload.
 
-Receivers ingest items into their local store keyed by `content_hash` with
-a `UNIQUE` constraint, so duplicates are silently dropped. This is the
-conflict-resolution strategy: last-write-wins by `created_at`, dedup by
-`content_hash`.
+Tailscale discovery polls online peers, or Termux uses a configured `peers.json`.
+An existing empty Termux peer list disables discovery. A successful LAN delivery
+suppresses a duplicate Tailscale send for that same certificate and item; an
+advertisement alone cannot suppress delivery.
 
-Senders must omit `image_data` for text items and must include it for
-image items (otherwise the receiver has nothing to write to disk).
-
-## Connection lifecycle
-
-```
-initiator                              acceptor
-  |                                       |
-  | TCP connect → :2029                   |
-  |─────────────────────────────────────► |
-  |                                       |
-  | frame: hello                          |
-  |─────────────────────────────────────► | register peer
-  |                                       |
-  | frame: item (optional, any time)      |
-  |─────────────────────────────────────► |
-  |                                       |
-  |     frame: item (optional, any time)  |
-  |◄───────────────────────────────────── |
-  |                                       |
-  ⋮ (kept open, idle is fine)             ⋮
-  |                                       |
-  | TCP close / timeout                   |
-  ⊥                                       ⊥
-```
-
-- The initiator should keep the connection open indefinitely. Send any new
-  local clipboard item as an item frame. When the connection drops,
-  reconnect with exponential backoff (start at 5s, double on each failure,
-  cap at 120s).
-- The acceptor uses the same socket to push its own clipboard items back.
-  This is what makes asymmetric-ACL tailnets work without requiring a
-  reverse ACL edge: only the dialer side needs `tag:X → tag:Y` allowed.
-- Either side may close the connection at any time. No graceful-shutdown
-  frame is required.
-
-## Discovery
-
-- LAN: mDNS service type `_clipd._tcp.local.`, TXT records:
-  - `hostname`: OS hostname of the advertiser.
-  - `tailnet_hostname` (optional): tailnet hostname when known. Helps
-    receivers dedup against tailnet-discovered peers.
-- Tailscale: poll `tailscale status --json` on a 10-second cadence. Filter
-  to `Peer[*].Online == true`. Use the first IPv4 from `TailscaleIPs`.
-  Treat dial failure to a discovered peer as "peer doesn't run ClipBar"
-  and back off silently.
-
-## Toggles
-
-ClipBar exposes one user-facing toggle, mirrored as a flag file:
-
-- `~/.config/clipd/.tailscale_off` — touch to disable Tailscale sync, delete
-  to re-enable. The macOS daemon checks this in its dial loop and broadcast
-  path. Other clients (Termux agent) can choose to mirror this with their
-  own equivalent (`$HOME/.config/clipa/disabled` or similar).
-
-## Versioning policy
-
-- Add new optional fields freely. Receivers ignore unknown fields.
-- Add new control-frame `_kind`s freely. Receivers ignore `_kind`s they
-  don't recognise.
-- Bump `version` for breaking changes only (changing existing field
-  semantics, removing required fields, changing the framing format).
+The Mac `.tailscale_off` flag disables the Tailscale dial/broadcast paths and
+connections arriving through Tailscale address ranges. It does not disable LAN.
+Tailscale provides an additional encrypted transport and access controls; it does
+not replace ClipBar pairing. The owner-only local peer-status file drives the
+native menu; there is no HTTP clipboard service.

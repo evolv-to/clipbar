@@ -4,12 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func captureTestLogs(t *testing.T) *bytes.Buffer {
@@ -35,7 +33,7 @@ func TestReceivePreservesClipboardContentWithoutLoggingIt(t *testing.T) {
 	t.Cleanup(func() { termuxClipSetPath = previous })
 	content := "synthetic-private-clipboard-content"
 	preview := "synthetic-private-clipboard-preview"
-	a := newAgent("test-self", "test-system", "")
+	a := newAgent("test-self", "test-system", "", testTrust(t))
 	a.applyItem(Item{Type: "text", Content: &content, Preview: preview, ContentHash: sha256Hex([]byte(content))}, "test-peer")
 	stored, err := os.ReadFile(outputPath)
 	if err != nil || string(stored) != content {
@@ -48,12 +46,12 @@ func TestReceivePreservesClipboardContentWithoutLoggingIt(t *testing.T) {
 
 func TestBroadcastPreservesPayloadWithoutLoggingIt(t *testing.T) {
 	logs := captureTestLogs(t)
-	left, right := net.Pipe()
-	t.Cleanup(func() { left.Close(); right.Close() })
-	left.SetDeadline(time.Now().Add(5 * time.Second))
-	right.SetDeadline(time.Now().Add(5 * time.Second))
-	a := newAgent("test-self", "test-system", "")
-	a.registry.adopt(&peerConn{ip: "test-peer", hostname: "test-peer", conn: left, w: bufio.NewWriter(left)})
+	trust, remote := testTrust(t), testTrust(t)
+	approve(t, trust, remote)
+	approve(t, remote, trust)
+	left, right := pairedConnection(t, trust, remote)
+	a := newAgent("test-self", "test-system", "", trust)
+	a.registry.adopt(&peerConn{ip: "test-peer", fingerprint: remote.identity, hostname: "test-peer", conn: left, w: bufio.NewWriter(left)})
 	payload := []byte(`{"type":"text","content":"synthetic-private-payload"}`)
 	type result struct {
 		data []byte

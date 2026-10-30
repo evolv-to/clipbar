@@ -14,7 +14,7 @@ You copy something. Five other things later, you need it back. With ClipBar:
 - Hit **⌘V** like normal — your most recent copy pastes instantly, *and* the panel opens so you can pick something older if that's not what you wanted. Pick a different item and ClipBar quietly undoes the first paste and swaps in the right one. Don't want it? Hit Esc, the original ⌘V stands.
 - Or hit **⌘⇧V** to just open the picker without pasting first.
 - Type to search across everything you've ever copied — text *and* images.
-- Copy something on your laptop, paste it on your desktop. Same Wi-Fi: zero config. Different networks: same thing, over Tailscale.
+- Copy something on your laptop, paste it on your desktop. After pairing, the same Wi-Fi discovers your devices automatically. Different networks: same thing, over Tailscale.
 - Copy on your phone, paste on your Mac (and back). The [`clipa`](clipa/) Termux agent puts your Android in the loop too.
 
 That's the whole product. It stays out of your way until you need it.
@@ -79,7 +79,7 @@ If you'd rather have ⌘V behave like the system default and only summon ClipBar
 
 ClipBar has three sync channels:
 
-- **LAN** (Bonjour). Zero config — both Macs on the same Wi-Fi find each other via mDNS (`_clipd._tcp.local.`) and exchange clipboard items over plain TCP on port 2029.
+- **LAN** (Bonjour). Explicitly paired Macs find each other via mDNS (`_clipd._tcp.local.`) and exchange clipboard items using mutually authenticated TLS 1.3 on port 2029.
 - **Tailscale**. When the [`tailscale`](https://tailscale.com) CLI is present, ClipBar enumerates your tailnet via `tailscale status --json` and keeps a long-lived encrypted connection (over WireGuard, port 2029) to every other ClipBar peer. Works across the public internet, on cellular, behind NATs. **Default ON if Tailscale is detected**; toggle from the menu bar icon → "Sync over Tailscale".
 - **iCloud Drive**. Writes each new item as a JSON snapshot in `~/Library/Mobile Documents/com~apple~CloudDocs/clipd/` whenever that directory is available and iCloud sync is enabled. This runs alongside LAN and Tailscale; it is not limited to fallback situations. Images are included in the snapshot.
 
@@ -88,14 +88,16 @@ Path selection: when both LAN and Tailscale are available between two Macs, **LA
 ### Privacy
 
 - Clipboard text and images are stored locally in `~/.config/clipd/` without application-level encryption. Credentials and other sensitive material you copy can become part of that history and sync to peers.
-- LAN sync uses plaintext TCP and has no application-level authentication or peer pairing. Use it only on a network whose participants you trust. Turning on Tailscale does not disable the LAN listener or change the preference for LAN traffic.
-- Tailscale traffic uses WireGuard encryption and your tailnet ACLs. ClipBar does not add a separate peer authorization step.
+- LAN and Tailscale sync require explicit certificate pairing on both devices and TLS 1.3. Discovery and network reachability do not authorize sharing. Older clients are rejected. Turning on Tailscale does not disable the LAN listener.
+- Tailscale adds WireGuard encryption and tailnet ACLs around ClipBar’s paired TLS connection. Image/file validation and local storage safeguards still apply on a personal tailnet.
 - iCloud snapshots leave your tailnet through iCloud Drive when that service syncs the directory. To opt out, create `~/.config/clipd/.icloud_off`; removing it re-enables snapshots. Existing snapshots must be removed separately if you no longer want them in iCloud Drive.
 - Current source logs clipboard events without including text previews. Logs still contain device names, addresses, paths, and errors, so review them before sharing. Older releases and existing logs may contain clipboard text.
 
-ClipBar does not provide a guarantee that copied secrets remain on one device. The plaintext LAN transport and lack of explicit peer pairing remain limitations of the current protocol.
+Copied secrets may still enter history and sync to approved devices. Pairing limits recipients; it does not recognize every secret. Follow the [pairing guide](docs/pairing.md) before enabling cross-device use.
 
 ### Setup for Tailscale sync
+
+First [pair both devices](docs/pairing.md). Protocol 1 clients must be upgraded; the experimental Kotlin client is not yet compatible.
 
 1. Install Tailscale on each Mac and join the same tailnet.
 2. Make sure your Tailscale ACL allows TCP/2029 between the devices that should sync — at minimum, you need *one direction* per pair (the side that can dial holds the connection for both directions, so an asymmetric ACL still works for bidirectional sync). ClipBar does not modify your ACL.
