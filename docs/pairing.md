@@ -1,7 +1,7 @@
 # Pair devices before syncing
 
-Upgrade all participating Macs and the Go Termux companion together. Old clients
-cannot sync with protocol 2. LAN discovery and Tailscale still find addresses, but
+ClipBar 0.5.0 introduces protocol 2. Upgrade all participating Macs and the Go
+Termux companion together. Old clients cannot sync with protocol 2. LAN discovery and Tailscale still find addresses, but
 clipboard data is shared only after **both devices explicitly approve each other**.
 The separate experimental Kotlin Android app is not compatible with this release.
 
