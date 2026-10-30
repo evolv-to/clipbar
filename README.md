@@ -147,9 +147,9 @@ Single Swift file (`ClipBar/Sources/ClipBar/AppDelegate.swift`). Single Python f
 
 ### Before committing
 
-Install [Gitleaks](https://github.com/gitleaks/gitleaks#installing) 8.30.1 or newer, then run `./scripts/install-hooks.sh`. The hook checks staged changes for credentials, personal paths, personal email addresses, and tailnet addresses. It also rejects force-added files covered by `.gitignore`, including clipboard databases, peer configuration, signing material, and build output. It blocks the commit if the scanner is unavailable.
+Install [Gitleaks](https://github.com/gitleaks/gitleaks#installing) 8.30.1 or newer, review the public identities in `.privacy-policy.json`, then run `./scripts/install-hooks.sh`. The installed hooks check exact staged content, commit identities and messages, and outgoing history before a push. They reject ignored runtime files and unreviewed opaque assets, and fail closed if the scanner is unavailable. Proposed edits cannot silently change the installed check.
 
-Keep machine-specific settings and any private denylist outside tracked files. Use a public GitHub noreply identity for commits. Review the exact staged file list before committing; scanners cannot recognize every kind of private content. Store release archives in GitHub Releases rather than adding build output to source control.
+Keep machine-specific settings and private research outside tracked files. Use the ignored `.privacy-denylist` for private literals and a reviewed public GitHub noreply identity for commits. Review the exact staged files; scanners cannot recognize every kind of private content. Check actual release packages separately before upload. See [the publication guide](docs/publication.md) for setup, policy updates, artifact checks and limitations.
 
 After a history privacy rewrite, replace old clones with a fresh clone before pushing again. Merging or pushing from an old clone can restore the removed history.
 
