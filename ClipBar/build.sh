@@ -30,6 +30,7 @@ swiftc \
     -framework Carbon \
     -O \
     "$SCRIPT_DIR/Sources/ClipBar/AppDelegate.swift" \
+    "$SCRIPT_DIR/Sources/ClipBar/ImageStore.swift" \
     "$SCRIPT_DIR/Sources/ClipBar/main.swift" \
     -o "$BINARY"
 

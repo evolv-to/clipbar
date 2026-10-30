@@ -6,13 +6,19 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import socket
 import sqlite3
+import stat
 import struct
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from image_store import (MAX_IMAGE_BYTES, delete_image, image_name, owned_path,
+                         read_image, validate_png, write_image)
 
 log = logging.getLogger("clipd")
 logging.basicConfig(
@@ -100,6 +106,16 @@ def setup_db() -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_created ON items(created_at DESC)"
     )
     conn.commit()
+    # Quarantine path fields in unsafe legacy rows without opening or deleting
+    # their targets. Existing history text remains available.
+    for row in conn.execute("SELECT id,type,content_hash,image_path FROM items WHERE image_path IS NOT NULL"):
+        try:
+            if row["type"] != "image":
+                raise ValueError("unexpected image path")
+            owned_path(IMAGES_DIR, row["content_hash"], row["image_path"])
+        except (ValueError, TypeError):
+            conn.execute("UPDATE items SET image_path=NULL WHERE id=?", (row["id"],))
+    conn.commit()
     return conn
 
 
@@ -109,7 +125,7 @@ def setup_db() -> sqlite3.Connection:
 
 def prune_items(conn: sqlite3.Connection) -> None:
     pruned = conn.execute("""
-        SELECT image_path FROM items
+        SELECT content_hash,image_path FROM items
         WHERE image_path IS NOT NULL
           AND id NOT IN (
               SELECT id FROM items ORDER BY created_at DESC LIMIT ?
@@ -124,9 +140,12 @@ def prune_items(conn: sqlite3.Connection) -> None:
     """, (MAX_ITEMS,))
     conn.commit()
 
-    for (path,) in pruned:
+    for content_hash, path in pruned:
         if path:
-            Path(path).unlink(missing_ok=True)
+            try:
+                delete_image(IMAGES_DIR, content_hash, path)
+            except (OSError, ValueError):
+                log.warning("skipped an unowned image while pruning")
 
 
 def insert_item(
@@ -286,9 +305,7 @@ class ClipboardWatcher:
         if png_data:
             raw = bytes(png_data)
             content_hash = hashlib.sha256(raw).hexdigest()
-            img_path = IMAGES_DIR / f"{content_hash}.png"
-            if not img_path.exists():
-                img_path.write_bytes(raw)
+            img_path = write_image(IMAGES_DIR, content_hash, raw)
 
             from AppKit import NSImage  # type: ignore[import]
             img = NSImage.alloc().initWithData_(png_data)
@@ -329,7 +346,8 @@ class ClipboardWatcher:
 # frames until EOF, ingest each.
 
 def _frame(payload: dict) -> bytes:
-    raw = json.dumps(payload).encode()
+    raw = json.dumps({key: value for key, value in payload.items()
+                      if key not in ("image_path", "id")}).encode()
     return struct.pack(">I", len(raw)) + raw
 
 
@@ -365,23 +383,39 @@ def _norm_host(name: str) -> str:
 
 def ingest_item(conn: sqlite3.Connection, item: dict, source_label: str) -> bool:
     """Insert a remote item into the local DB. Returns True if new."""
-    if item.get("type") == "image" and "image_data" in item:
-        try:
-            raw = base64.b64decode(item.pop("image_data"))
-            img_path = IMAGES_DIR / f"{item['content_hash']}.png"
-            img_path.write_bytes(raw)
-            item["image_path"] = str(img_path)
-        except Exception as exc:
-            log.debug("image ingest failed: %s", exc)
-
+    try:
+        if not isinstance(item, dict):
+            raise ValueError("invalid item")
+        kind = item.get("type")
+        identifier = item.get("content_hash")
+        image_name(identifier)  # canonical SHA-256 for both supported types
+        source = item.get("source_mac", source_label)
+        if not isinstance(source, str) or len(source) > 255 or any(ord(c) < 32 for c in source):
+            raise ValueError("invalid source")
+        image_path = None
+        content = None
+        if kind == "text":
+            content = item.get("content")
+            if not isinstance(content, str) or len(content.encode()) > 1024 * 1024:
+                raise ValueError("invalid text")
+            if hashlib.sha256(content.encode()).hexdigest() != identifier:
+                raise ValueError("text hash mismatch")
+            preview = content[:120].replace("\n", " ").strip() or "[empty]"
+        elif kind == "image":
+            encoded = item.get("image_data")
+            if not isinstance(encoded, str) or len(encoded) > 4 * ((MAX_IMAGE_BYTES + 2) // 3):
+                raise ValueError("invalid image data")
+            raw = base64.b64decode(encoded, validate=True)
+            width, height = validate_png(raw)
+            image_path = str(write_image(IMAGES_DIR, identifier, raw))
+            preview = f"[image {width}×{height}]"
+        else:
+            raise ValueError("unsupported item type")
+    except (ValueError, TypeError, OSError):
+        log.warning("rejected invalid clipboard item")
+        return False
     result = insert_item(
-        conn,
-        item["type"],
-        item.get("content"),
-        item.get("image_path"),
-        item["preview"],
-        item["content_hash"],
-        item.get("source_mac", source_label),
+        conn, kind, content, image_path, preview, identifier, source,
     )
     if result:
         log.info("received clipboard item from %s", source_label)
@@ -887,17 +921,27 @@ class ICloudSync:
     async def write(self, item: dict) -> None:
         if not _icloud_enabled():
             return
-        out = dict(item)
-        if out.get("image_path") and "image_data" not in out:
+        out = {key: value for key, value in item.items() if key not in ("image_path", "id")}
+        if item.get("type") == "image":
             try:
                 out["image_data"] = base64.b64encode(
-                    Path(out["image_path"]).read_bytes()
+                    read_image(IMAGES_DIR, item["content_hash"], item.get("image_path"))
                 ).decode()
-            except Exception:
-                pass
+            except (OSError, ValueError, KeyError):
+                log.warning("skipped unowned image during cloud export")
+                return
         path = ICLOUD_DIR / f"{HOSTNAME}-latest.json"
         try:
-            path.write_text(json.dumps(out))
+            if ICLOUD_DIR.is_symlink():
+                raise OSError("cloud directory is a symlink")
+            with tempfile.NamedTemporaryFile(mode="w", dir=ICLOUD_DIR, delete=False) as stream:
+                temporary = Path(stream.name)
+                try:
+                    json.dump(out, stream)
+                    stream.close()
+                    os.replace(temporary, path)
+                finally:
+                    temporary.unlink(missing_ok=True)
         except OSError as exc:
             # The iCloud Drive file provider can transiently fail (EDEADLK
             # "resource deadlock avoided", eviction, sync locks). Swallow it —
@@ -930,28 +974,19 @@ class ICloudSync:
 
     async def _ingest(self, path: Path) -> None:
         try:
-            item = json.loads(path.read_text())
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("invalid snapshot file")
+                data = stream.read(MAX_FRAME_BYTES + 1)
+            if len(data) > MAX_FRAME_BYTES:
+                raise ValueError("oversized snapshot")
+            item = json.loads(data)
         except Exception as exc:
             log.debug("icloud ingest error %s: %s", path, exc)
             return
 
-        if item.get("type") == "image" and "image_data" in item:
-            raw = base64.b64decode(item.pop("image_data"))
-            img_path = IMAGES_DIR / f"{item['content_hash']}.png"
-            img_path.write_bytes(raw)
-            item["image_path"] = str(img_path)
-
-        result = insert_item(
-            self._conn,
-            item["type"],
-            item.get("content"),
-            item.get("image_path"),
-            item["preview"],
-            item["content_hash"],
-            item.get("source_mac", "icloud"),
-        )
-        if result:
-            log.info("received clipboard item from iCloud")
+        ingest_item(self._conn, item, "iCloud")
 
 
 # ---------------------------------------------------------------------------
@@ -1101,10 +1136,15 @@ def make_app(
         return web.json_response(get_items(conn, query=q))
 
     async def image_handler(req: web.Request) -> web.Response:
-        p = IMAGES_DIR / req.match_info["filename"]
-        if not p.exists():
+        filename = req.match_info["filename"]
+        try:
+            identifier = filename.removesuffix(".png")
+            if filename != image_name(identifier):
+                raise ValueError("invalid filename")
+            raw = read_image(IMAGES_DIR, identifier, str(IMAGES_DIR / filename))
+        except (ValueError, OSError):
             raise web.HTTPNotFound()
-        return web.FileResponse(p)
+        return web.Response(body=raw, content_type="image/png")
 
     async def promote_handler(req: web.Request) -> web.Response:
         body = await req.json()
@@ -1115,6 +1155,13 @@ def make_app(
         if not item:
             raise web.HTTPNotFound()
 
+        raw = None
+        if item["type"] == "image":
+            try:
+                raw = read_image(IMAGES_DIR, item["content_hash"], item["image_path"])
+            except (OSError, ValueError):
+                raise web.HTTPNotFound()
+
         watcher.suppress_next()
         from AppKit import NSData, NSPasteboard  # type: ignore[import]
         pb = NSPasteboard.generalPasteboard()
@@ -1122,7 +1169,6 @@ def make_app(
         if item["type"] == "text":
             pb.setString_forType_(item["content"], "public.utf8-plain-text")
         else:
-            raw = Path(item["image_path"]).read_bytes()
             ns_data = NSData.dataWithBytes_length_(raw, len(raw))
             pb.setData_forType_(ns_data, "public.png")
 
@@ -1199,14 +1245,14 @@ async def main() -> None:
         # Each sync sink is independent and best-effort: a failure in one
         # (e.g. a transient iCloud Drive file lock, an unreachable peer) must
         # never propagate up and kill the capture loop, nor block the others.
-        payload = dict(item)
+        payload = {key: value for key, value in item.items() if key not in ("image_path", "id")}
         for name, sink in (
             ("lan", lan.broadcast),
             ("tailscale", tailscale.broadcast),
             ("icloud", icloud.write),
         ):
             try:
-                await sink(payload)
+                await sink(item if name == "icloud" else payload)
             except Exception as exc:
                 log.warning("%s sync failed (capture preserved): %s", name, exc)
 

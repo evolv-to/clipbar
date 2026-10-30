@@ -41,6 +41,7 @@ struct ClipItem {
     let type: String
     let content: String?
     let imagePath: String?
+    let contentHash: String
     let preview: String
     let createdAt: Double
     let sourceMac: String
@@ -60,8 +61,8 @@ final class ClipDatabase {
     func items(query: String = "") -> [ClipItem] {
         guard db != nil else { return [] }
         let sql = query.isEmpty
-            ? "SELECT id,type,content,image_path,preview,created_at,source_mac FROM items ORDER BY created_at DESC LIMIT 200"
-            : "SELECT id,type,content,image_path,preview,created_at,source_mac FROM items WHERE type='text' AND content LIKE ? ORDER BY created_at DESC LIMIT 200"
+            ? "SELECT id,type,content,image_path,preview,created_at,source_mac,content_hash FROM items ORDER BY created_at DESC LIMIT 200"
+            : "SELECT id,type,content,image_path,preview,created_at,source_mac,content_hash FROM items WHERE type='text' AND content LIKE ? ORDER BY created_at DESC LIMIT 200"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(stmt) }
@@ -78,6 +79,7 @@ final class ClipDatabase {
                 type:      sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "",
                 content:   sqlite3_column_text(stmt, 2).map { String(cString: $0) },
                 imagePath: sqlite3_column_text(stmt, 3).map { String(cString: $0) },
+                contentHash: sqlite3_column_text(stmt, 7).map { String(cString: $0) } ?? "",
                 preview:   sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? "",
                 createdAt: sqlite3_column_double(stmt, 5),
                 sourceMac: sqlite3_column_text(stmt, 6).map { String(cString: $0) } ?? ""
@@ -150,7 +152,8 @@ final class ClipCell: NSTableCellView {
     required init?(coder: NSCoder) { fatalError() }
 
     func configure(_ item: ClipItem) {
-        if item.type == "image", let p = item.imagePath, let img = NSImage(contentsOfFile: p) {
+        if item.type == "image", let data = ImageStore.read(item.contentHash, path: item.imagePath),
+           let img = NSImage(data: data) {
             thumb.image = img
             thumb.contentTintColor = nil
             thumb.layer?.borderWidth = 1
@@ -434,8 +437,8 @@ final class ClipViewController: NSViewController,
         if row >= 0, row < items.count {
             let item = items[row]
             if item.type == "image",
-               let p = item.imagePath,
-               let img = NSImage(contentsOfFile: p) {
+               let data = ImageStore.read(item.contentHash, path: item.imagePath),
+               let img = NSImage(data: data) {
                 previewImage.image = img
                 let dims = "\(Int(img.size.width)) × \(Int(img.size.height))"
                 previewMeta.stringValue = dims
@@ -879,13 +882,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let match = findItemMatching(clipboard: pb)
 
-            if let match = match {
+            if let match = match, writeClipboard(for: match) {
                 // Clipboard contents are tracked in our history — own the
                 // paste so images get the path-string fallback for text-only
                 // targets, and remember the item so the panel can offer a
                 // clean swap-with-undo.
                 lastAutoPaste = AutoPasteSnapshot(item: match, pastedText: match.content)
-                writeClipboard(for: match)
                 simulateKey(virtualKey: 0x09, flags: .maskCommand, toPid: pid)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
                     self?.presentPanel()
@@ -1105,7 +1107,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Capture before closePanel clears it.
         let undoTarget = lastAutoPaste
 
-        writeClipboard(for: item)
+        guard writeClipboard(for: item) else {
+            NSSound.beep()
+            return
+        }
         closePanel(restoreFocus: false)
 
         guard let prev = previousApp else { return }
@@ -1217,17 +1222,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// path as string fallback so text-only targets (terminal, browser bar)
     /// still get something useful. The suppress flag tells `clipd` not to
     /// echo this write back into history.
-    private func writeClipboard(for item: ClipItem) {
+    private func writeClipboard(for item: ClipItem) -> Bool {
+        let imageData = item.type == "image" ? ImageStore.read(item.contentHash, path: item.imagePath) : nil
+        guard (item.type == "text" && item.content != nil) || imageData != nil else { return false }
         FileManager.default.createFile(atPath: suppressPath, contents: nil)
         let pb = NSPasteboard.general
         pb.clearContents()
         if item.type == "text", let text = item.content {
             pb.setString(text, forType: .string)
-        } else if let path = item.imagePath,
-                  let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
+        } else if let path = item.imagePath, let data = imageData {
             pb.setData(data, forType: .png)
             pb.setString(path, forType: .string)
         }
+        return true
     }
 
     /// Synthesize a keystroke. If `toPid` is given the event is delivered
