@@ -273,7 +273,7 @@ final class ClipViewController: NSViewController,
 
     private func buildSearch() {
         search.translatesAutoresizingMaskIntoConstraints = false
-        search.placeholderString = "Search…"
+        search.placeholderString = "Search text history…"
         search.target   = self
         search.action   = #selector(searchChanged)
         search.delegate = self
@@ -469,6 +469,7 @@ final class ClipViewController: NSViewController,
         let prev = resetSelection ? -1 : table.selectedRow
         items = db.items(query: isSearchVisible ? search.stringValue : "")
         table.reloadData()
+        empty.stringValue = isSearchVisible && !search.stringValue.isEmpty ? "No matching text" : "Nothing copied yet"
         empty.isHidden = !items.isEmpty
         if items.isEmpty {
             updatePreview(for: -1)

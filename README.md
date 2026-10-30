@@ -13,7 +13,7 @@ You copy something. Five other things later, you need it back. With ClipBar:
 
 - Hit **⌘V** like normal — your most recent copy pastes instantly, *and* the panel opens so you can pick something older if that's not what you wanted. Pick a different item and ClipBar quietly undoes the first paste and swaps in the right one. Don't want it? Hit Esc, the original ⌘V stands.
 - Or hit **⌘⇧V** to just open the picker without pasting first.
-- Type to search across everything you've ever copied — text *and* images.
+- Press **⌘F** or **/** in the picker to search recent text history. Browse images with thumbnails and full previews.
 - Copy something on your laptop, paste it on your desktop. After pairing, the same Wi-Fi discovers your devices automatically. Different networks: same thing, over Tailscale.
 - Copy on your phone, paste on your Mac (and back). The [`clipa`](clipa/) Termux agent puts your Android in the loop too.
 
@@ -70,7 +70,7 @@ If you'd rather have ⌘V behave like the system default and only summon ClipBar
 | Just open the picker | ⌘⇧V |
 | Navigate the list | ↑ ↓ |
 | Jump | PgUp / PgDn / Home / End |
-| Filter | Just type — selection stays live |
+| Search text history | ⌘F or /, then type |
 | Paste selected item (swaps if auto-paste already fired) | ↩ |
 | Cancel (keeps the auto-paste if it fired) | ⎋ |
 | Status icon menu | Right-click — Auto-paste, Open on ⌘V, Restart, Quit |
