@@ -8,7 +8,13 @@ BINARY="$BUNDLE/Contents/MacOS/$APP_NAME"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 BUNDLE_ID="app.clipbar.ClipBar"
 LOCAL_CERT="ClipBar Local"
-LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+SIGNING_KEYCHAIN="${CLIPBAR_SIGNING_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
+
+find_local_identity() {
+    security find-identity -p codesigning "$SIGNING_KEYCHAIN" \
+        | awk -v label="$LOCAL_CERT" 'index($0, "\"" label "\"") {print $2}' \
+        | sort -u
+}
 
 echo "==> Building $APP_NAME..."
 
@@ -33,12 +39,13 @@ swiftc \
 # `-v` is intentionally omitted: self-signed certs are flagged
 # CSSMERR_TP_NOT_TRUSTED but codesign still uses them. We sign by SHA1
 # hash to disambiguate if multiple matching identities ever exist.
-CERT_HASH=$(security find-identity -p codesigning 2>/dev/null \
-            | grep "\"$LOCAL_CERT\"" | head -1 | awk '{print $2}')
+CERT_HASH=$(find_local_identity)
 
 if [ -z "$CERT_HASH" ]; then
     echo "==> Creating local code-signing cert ($LOCAL_CERT)..."
+    umask 077
     TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
     cat > "$TMP/cert.conf" <<EOF
 [req]
 distinguished_name = req_dn
@@ -54,21 +61,26 @@ EOF
     openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
         -keyout "$TMP/key.pem" -out "$TMP/cert.pem" \
         -config "$TMP/cert.conf" -extensions v3 >/dev/null 2>&1
-    P12_PASS="clipbar"
+    P12_PASS=$(openssl rand -hex 16)
     openssl pkcs12 -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
         -out "$TMP/cert.p12" -name "$LOCAL_CERT" \
         -passout "pass:$P12_PASS" -macalg sha1 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES >/dev/null 2>&1
-    security import "$TMP/cert.p12" -k "$LOGIN_KEYCHAIN" -P "$P12_PASS" \
-        -T /usr/bin/codesign -T /usr/bin/security >/dev/null
-    security set-key-partition-list -S apple-tool:,apple:,codesign: \
-        -s -k "" "$LOGIN_KEYCHAIN" >/dev/null 2>&1 || true
+    # Grant access only while importing this new key. Never rewrite partition
+    # lists for other signing keys, or guess the user's keychain password.
+    security import "$TMP/cert.p12" -k "$SIGNING_KEYCHAIN" -P "$P12_PASS" \
+        -T /usr/bin/codesign >/dev/null
     rm -rf "$TMP"
-    CERT_HASH=$(security find-identity -p codesigning 2>/dev/null \
-                | grep "\"$LOCAL_CERT\"" | head -1 | awk '{print $2}')
+    trap - EXIT
+    CERT_HASH=$(find_local_identity)
 fi
 
+if [[ ! "$CERT_HASH" =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo 'Expected exactly one ClipBar Local signing identity in the selected keychain.' >&2
+    exit 1
+fi
 echo "==> Codesigning with $LOCAL_CERT ($CERT_HASH)..."
 codesign --force --sign "$CERT_HASH" \
+    --keychain "$SIGNING_KEYCHAIN" \
     --identifier "$BUNDLE_ID" \
     --timestamp=none \
     "$BINARY"
