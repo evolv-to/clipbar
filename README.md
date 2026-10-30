@@ -117,6 +117,10 @@ Three pieces, all small:
 
 Macs share `~/.config/clipd/history.db` between `clipd` and `ClipBar`. Either can run without the other (you'll lose monitoring or you'll lose UI, respectively).
 
+The daemon writes an owner-only `~/.config/clipd/peer-status.json` snapshot for the
+native menu. Snapshots older than ten seconds are ignored. There is no local HTTP
+clipboard API; the former port 2028 and web clipboard routes have been removed.
+
 Wire protocol shared by all three clients: [`PROTOCOL.md`](PROTOCOL.md).
 
 ## Uninstall

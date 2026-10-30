@@ -11,8 +11,6 @@ import unittest
 from unittest.mock import patch
 import zlib
 
-from aiohttp.test_utils import TestClient, TestServer
-from yarl import URL
 import clipd
 from image_store import read_image, write_image
 
@@ -175,32 +173,6 @@ class ImageBoundaryTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(target.read_text())
         self.assertNotIn('image_path', payload)
         self.assertEqual(base64.b64decode(payload['image_data']), self.raw)
-
-    async def test_actual_http_response_blocks_traversal_and_serves_owned_png(self):
-        async def on_new(_):
-            pass
-        app = clipd.make_app(self.conn, clipd.ClipboardWatcher(self.conn, on_new))
-        client = TestClient(TestServer(app))
-        await client.start_server()
-        try:
-            encoded = str(self.outside).replace('/', '%2F')
-            for suffix in (encoded, '%2e%2e%2foutside.png', 'unknown.png'):
-                response = await client.get(URL('/images/' + suffix, encoded=True))
-                self.assertEqual(response.status, 404)
-                self.assertNotEqual(await response.read(), self.raw)
-            write_image(self.images, self.identifier, self.raw)
-            response = await client.get('/images/' + self.path.name)
-            self.assertEqual(response.status, 200)
-            self.assertEqual(await response.read(), self.raw)
-            self.path.unlink()
-            self.path.symlink_to(self.outside)
-            response = await client.get('/images/' + self.path.name)
-            self.assertEqual(response.status, 404)
-            clipd.insert_item(self.conn, 'image', None, str(self.outside), 'synthetic', self.identifier)
-            response = await client.post('/promote', json={'id': 1})
-            self.assertEqual(response.status, 404)  # rejected before any pasteboard access
-        finally:
-            await client.close()
 
     def test_wire_frame_excludes_local_paths(self):
         payload = json.loads(clipd._frame(self.item)[4:])

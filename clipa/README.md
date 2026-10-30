@@ -86,7 +86,7 @@ pkill -f '~/.local/bin/clipa'
 On any Mac running ClipBar:
 
 ```bash
-curl -s http://127.0.0.1:2028/peers | jq
+cat ~/.config/clipd/peer-status.json | jq
 ```
 
 You should see your phone's tailnet hostname under `tailscale[*]`. Then:

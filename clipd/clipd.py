@@ -12,13 +12,13 @@ import sqlite3
 import stat
 import struct
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from image_store import (MAX_IMAGE_BYTES, delete_image, image_name, owned_path,
                          read_image, validate_png, write_image)
+from private_files import write_private
 
 log = logging.getLogger("clipd")
 logging.basicConfig(
@@ -52,7 +52,6 @@ def _icloud_enabled() -> bool:
 
 MAX_ITEMS = 500
 POLL_INTERVAL = 0.3
-HTTP_PORT = 2028
 LAN_PORT = 2029
 PROTOCOL_VERSION = 1
 HOSTNAME = socket.gethostname()
@@ -932,16 +931,7 @@ class ICloudSync:
                 return
         path = ICLOUD_DIR / f"{HOSTNAME}-latest.json"
         try:
-            if ICLOUD_DIR.is_symlink():
-                raise OSError("cloud directory is a symlink")
-            with tempfile.NamedTemporaryFile(mode="w", dir=ICLOUD_DIR, delete=False) as stream:
-                temporary = Path(stream.name)
-                try:
-                    json.dump(out, stream)
-                    stream.close()
-                    os.replace(temporary, path)
-                finally:
-                    temporary.unlink(missing_ok=True)
+            write_private(path, json.dumps(out).encode())
         except OSError as exc:
             # The iCloud Drive file provider can transiently fail (EDEADLK
             # "resource deadlock avoided", eviction, sync locks). Swallow it —
@@ -990,214 +980,36 @@ class ICloudSync:
 
 
 # ---------------------------------------------------------------------------
-# HTTP server
+# Native peer status (local owner-only file; no HTTP clipboard API)
 # ---------------------------------------------------------------------------
 
-PANEL_HTML = r"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>ClipBar</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#1c1c1e;--surface:#2c2c2e;--hover:#3a3a3c;--border:#3a3a3c;
-  --text:#f2f2f7;--muted:#8e8e93;--accent:#0a84ff;--r:10px;
-}
-@media(prefers-color-scheme:light){
-  :root{--bg:#f2f2f7;--surface:#fff;--hover:#e5e5ea;--border:#d1d1d6;
-        --text:#1c1c1e;--muted:#8e8e93;--accent:#007aff;}
-}
-html,body{height:100%;overflow:hidden}
-body{
-  background:var(--bg);color:var(--text);
-  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;
-  font-size:13px;display:flex;flex-direction:column;
-}
-.top{padding:10px 12px 0;display:flex;align-items:center;justify-content:space-between}
-.top h1{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
-.top .cnt{font-size:11px;color:var(--muted)}
-.search{padding:8px 10px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border)}
-.search svg{color:var(--muted);flex-shrink:0}
-.search input{background:transparent;border:none;outline:none;color:var(--text);font-size:13px;width:100%;font-family:inherit}
-.search input::placeholder{color:var(--muted)}
-.list{flex:1;overflow-y:auto;padding:6px}
-.list::-webkit-scrollbar{width:4px}
-.list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.item{
-  display:flex;align-items:center;gap:10px;padding:8px 10px;
-  border-radius:var(--r);cursor:pointer;transition:background .08s;margin-bottom:2px;min-height:52px;
-}
-.item:hover,.item.sel{background:var(--hover)}
-.item.sel{outline:1px solid var(--accent)55;background:color-mix(in srgb,var(--accent) 12%,var(--hover))}
-.thumb{width:38px;height:38px;border-radius:6px;object-fit:cover;flex-shrink:0;background:var(--border)}
-.icon{
-  width:38px;height:38px;border-radius:6px;background:var(--surface);
-  border:1px solid var(--border);display:flex;align-items:center;justify-content:center;
-  flex-shrink:0;font-size:17px;
-}
-.body{flex:1;min-width:0}
-.preview{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.45}
-.preview.mono{font-family:'SF Mono',Menlo,monospace;font-size:12px}
-.meta{color:var(--muted);font-size:11px;margin-top:2px;display:flex;gap:6px}
-.empty{text-align:center;color:var(--muted);padding:48px 20px;font-size:13px}
-.close-btn{
-  background:none;border:none;cursor:pointer;color:var(--muted);padding:2px 4px;
-  border-radius:4px;font-size:15px;line-height:1;transition:color .1s;
-}
-.close-btn:hover{color:var(--text)}
-</style>
-</head>
-<body>
-<div class="top"><h1>Clipboard</h1><div style="display:flex;align-items:center;gap:8px"><span class="cnt" id="cnt"></span><button class="close-btn" onclick="closePanel()" title="Close (Esc)">✕</button></div></div>
-<div class="search">
-  <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
-    <path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z"/>
-  </svg>
-  <input id="q" type="search" placeholder="Search…" autocomplete="off">
-</div>
-<div class="list" id="list"></div>
-<script>
-let items=[], sel=0;
-const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-function ago(ts){
-  const d=Date.now()/1e3-ts;
-  if(d<60)return Math.floor(d)+'s';
-  if(d<3600)return Math.floor(d/60)+'m';
-  if(d<86400)return Math.floor(d/3600)+'h';
-  return Math.floor(d/86400)+'d';
-}
-function closePanel(){try{window.webkit.messageHandlers.close.postMessage(null);}catch{}}
-async function load(q=''){
-  try{
-    const r=await fetch(q?`/items?q=${encodeURIComponent(q)}`:'/items');
-    items=await r.json();
-    render();
-  }catch{
-    document.getElementById('list').innerHTML='<div class="empty">Starting daemon…</div>';
-    setTimeout(()=>load(q),1500);
-  }
-}
-function render(){
-  document.getElementById('cnt').textContent=items.length+' items';
-  const L=document.getElementById('list');
-  if(!items.length){L.innerHTML='<div class="empty">Nothing copied yet</div>';return;}
-  L.innerHTML=items.map((it,i)=>{
-    const isImg=it.type==='image';
-    const thumb=isImg
-      ?`<img class="thumb" src="/images/${it.content_hash}.png" loading="lazy">`
-      :`<div class="icon">📋</div>`;
-    const src=it.source_mac&&it.source_mac!==location.hostname?`<span>📡 ${esc(it.source_mac)}</span>`:'';
-    return`<div class="item${i===sel?' sel':''}" data-id="${it.id}" data-i="${i}">
-      ${thumb}
-      <div class="body">
-        <div class="preview${isImg?'':' mono'}">${esc(it.preview)}</div>
-        <div class="meta"><span>${ago(it.created_at)}</span>${src}</div>
-      </div>
-    </div>`;
-  }).join('');
-}
-async function pick(id){
-  await fetch('/promote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
-  try{window.webkit.messageHandlers.paste.postMessage(id);}catch{}
-}
-document.getElementById('list').addEventListener('click',e=>{
-  const el=e.target.closest('.item');
-  if(el)pick(+el.dataset.id);
-});
-document.addEventListener('keydown',e=>{
-  if(e.key==='ArrowDown'){sel=Math.min(sel+1,items.length-1);render();e.preventDefault();}
-  else if(e.key==='ArrowUp'){sel=Math.max(sel-1,0);render();e.preventDefault();}
-  else if(e.key==='Enter'&&items[sel]){pick(items[sel].id);}
-  else if(e.key==='Escape'){try{window.webkit.messageHandlers.close.postMessage(null);}catch{}}
-});
-document.getElementById('q').addEventListener('input',e=>{sel=0;load(e.target.value);});
-setInterval(()=>{if(!document.getElementById('q').value)load();},2500);
-load();
-document.getElementById('q').focus();
-</script>
-</body>
-</html>"""
+def write_peer_status(lan: "LANSync", tailscale: "TailscaleSync") -> None:
+    snapshot = {
+        "self": HOSTNAME,
+        "lan": lan.peer_status(),
+        "tailscale": tailscale.peer_status(),
+        "tailscale_discovered": tailscale.discovered_status(),
+        "tailscale_available": tailscale.is_available(),
+        "tailscale_enabled": tailscale.is_enabled(),
+    }
+    write_private(CONFIG_DIR / "peer-status.json", json.dumps(snapshot).encode())
 
 
-def make_app(
-    conn: sqlite3.Connection,
-    watcher: ClipboardWatcher,
-    lan: Optional["LANSync"] = None,
-    tailscale: Optional["TailscaleSync"] = None,
-) -> Any:
-    from aiohttp import web  # type: ignore[import]
-
-    async def index(_: web.Request) -> web.Response:
-        return web.Response(text=PANEL_HTML, content_type="text/html")
-
-    async def items_handler(req: web.Request) -> web.Response:
-        q = req.query.get("q", "")
-        return web.json_response(get_items(conn, query=q))
-
-    async def image_handler(req: web.Request) -> web.Response:
-        filename = req.match_info["filename"]
-        try:
-            identifier = filename.removesuffix(".png")
-            if filename != image_name(identifier):
-                raise ValueError("invalid filename")
-            raw = read_image(IMAGES_DIR, identifier, str(IMAGES_DIR / filename))
-        except (ValueError, OSError):
-            raise web.HTTPNotFound()
-        return web.Response(body=raw, content_type="image/png")
-
-    async def promote_handler(req: web.Request) -> web.Response:
-        body = await req.json()
-        item_id = int(body.get("id", 0))
-        if not item_id:
-            raise web.HTTPBadRequest()
-        item = promote_item(conn, item_id)
-        if not item:
-            raise web.HTTPNotFound()
-
-        raw = None
-        if item["type"] == "image":
+async def publish_peer_status(lan: "LANSync", tailscale: "TailscaleSync") -> None:
+    try:
+        while True:
             try:
-                raw = read_image(IMAGES_DIR, item["content_hash"], item["image_path"])
+                write_peer_status(lan, tailscale)
             except (OSError, ValueError):
-                raise web.HTTPNotFound()
-
-        watcher.suppress_next()
-        from AppKit import NSData, NSPasteboard  # type: ignore[import]
-        pb = NSPasteboard.generalPasteboard()
-        pb.clearContents()
-        if item["type"] == "text":
-            pb.setString_forType_(item["content"], "public.utf8-plain-text")
-        else:
-            ns_data = NSData.dataWithBytes_length_(raw, len(raw))
-            pb.setData_forType_(ns_data, "public.png")
-
-        return web.json_response({"ok": True})
-
-    async def health(_: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "hostname": HOSTNAME})
-
-    async def peers_handler(_: web.Request) -> web.Response:
-        lan_peers = lan.peer_status() if lan else []
-        ts_peers = tailscale.peer_status() if tailscale else []
-        ts_discovered = tailscale.discovered_status() if tailscale else []
-        return web.json_response({
-            "self": HOSTNAME,
-            "lan": lan_peers,
-            "tailscale": ts_peers,
-            "tailscale_discovered": ts_discovered,
-            "tailscale_available": bool(tailscale and tailscale.is_available()),
-            "tailscale_enabled": bool(tailscale and tailscale.is_enabled()),
-        })
-
-    app = web.Application()
-    app.router.add_get("/", index)
-    app.router.add_get("/items", items_handler)
-    app.router.add_get("/images/{filename}", image_handler)
-    app.router.add_post("/promote", promote_handler)
-    app.router.add_get("/health", health)
-    app.router.add_get("/peers", peers_handler)
-    return app
+                log.warning("could not update local peer status")
+            await asyncio.sleep(2.0)
+    finally:
+        # A stopped daemon must not leave a connected status behind. The native
+        # reader also rejects snapshots older than ten seconds after a crash.
+        try:
+            (CONFIG_DIR / "peer-status.json").unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1258,12 +1070,6 @@ async def main() -> None:
 
     watcher = ClipboardWatcher(conn, on_new)
 
-    from aiohttp import web  # type: ignore[import]
-    runner = web.AppRunner(make_app(conn, watcher, lan, tailscale))
-    await runner.setup()
-    await web.TCPSite(runner, "127.0.0.1", HTTP_PORT).start()
-    log.info("HTTP on http://127.0.0.1:%d", HTTP_PORT)
-
     try:
         await tailscale.start()
     except Exception as exc:
@@ -1277,7 +1083,7 @@ async def main() -> None:
     except Exception as exc:
         log.warning("LAN sync disabled: %s", exc)
 
-    await asyncio.gather(watcher.run(), icloud.watch())
+    await asyncio.gather(watcher.run(), icloud.watch(), publish_peer_status(lan, tailscale))
 
 
 if __name__ == "__main__":

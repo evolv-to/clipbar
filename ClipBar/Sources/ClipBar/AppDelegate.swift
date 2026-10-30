@@ -11,7 +11,6 @@ private let silencePath  = NSHomeDirectory() + "/.config/clipd/.silent"
 private let tailscaleOffPath = NSHomeDirectory() + "/.config/clipd/.tailscale_off"
 private let axPromptedKey = "ClipBar.didPromptAccessibility"
 private let interceptCmdVKey = "ClipBar.interceptCmdV"
-private let peersURL = URL(string: "http://127.0.0.1:2028/peers")!
 
 private let localHostName: String = {
     var buf = [CChar](repeating: 0, count: 256)
@@ -754,17 +753,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func fetchPeerSnapshot() -> PeerSnapshot? {
-        var req = URLRequest(url: peersURL)
-        req.timeoutInterval = 0.4
-        let sem = DispatchSemaphore(value: 0)
-        var data: Data?
-        let task = URLSession.shared.dataTask(with: req) { d, _, _ in
-            data = d
-            sem.signal()
-        }
-        task.resume()
-        _ = sem.wait(timeout: .now() + 0.5)
-        guard let d = data,
+        guard let d = PeerStatus.read(),
               let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
             return nil
         }

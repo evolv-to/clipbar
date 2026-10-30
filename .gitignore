@@ -30,6 +30,7 @@ clipd/__pycache__/
 *.sqlite3
 *.sqlite3-*
 peers.json
+peer-status.json
 *-latest.json
 clipboard-history/
 clipboard-exports/
