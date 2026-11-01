@@ -374,7 +374,8 @@ final class ClipViewController: NSViewController,
         table.delegate    = self
         table.onEnter  = { [weak self] in self?.activateRow(self?.table.selectedRow ?? -1) }
         table.onEscape = { [weak self] in self?.onDismiss?() }
-        table.doubleAction = #selector(rowDoubleClicked)
+        table.action = #selector(rowClicked)
+        table.doubleAction = #selector(rowClicked)
         table.target = self
 
         scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -485,7 +486,7 @@ final class ClipViewController: NSViewController,
         updatePreview(for: table.selectedRow)
     }
 
-    @objc private func rowDoubleClicked() { activateRow(table.clickedRow) }
+    @objc private func rowClicked() { activateRow(table.clickedRow) }
 
     private func activateRow(_ row: Int) {
         guard row >= 0, row < items.count else { return }

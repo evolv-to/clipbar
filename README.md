@@ -71,7 +71,7 @@ If you'd rather have ⌘V behave like the system default and only summon ClipBar
 | Navigate the list | ↑ ↓ |
 | Jump | PgUp / PgDn / Home / End |
 | Search text history | ⌘F or /, then type |
-| Paste selected item (swaps if auto-paste already fired) | ↩ |
+| Paste an item (swaps if auto-paste already fired) | Click a row, or select it and press ↩ |
 | Cancel (keeps the auto-paste if it fired) | ⎋ |
 | Status icon menu | Right-click — Auto-paste, Open on ⌘V, Restart, Quit |
 
